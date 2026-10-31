@@ -60,21 +60,22 @@ later reinstall.
 
 ## Performance
 
-Measured on an NVIDIA TITAN V (Volta, 12 GB HBM2) at one busy outdoor spot, 30-second averages, with
-FSR as the anti-aliasing method at 100% render scale:
+Measured on an NVIDIA TITAN V (Volta, 12 GB HBM2) at one busy outdoor spot, 30-second averages, 100% render
+scale, GPU at about 1650 MHz:
 
-| Preset | 1440p | 1080p |
-|---|---|---|
-| High | 42.6 FPS (min 39.0) | 51.3 FPS (min 46.5) |
-| Medium | 46.1 FPS (min 43.3) | 53.9 FPS (min 50.1) |
-| Low | 53.0 FPS (min 49.1) | 63.7 FPS (min 57.8) |
+| Preset | 1440p, TAAU | 1440p, FSR | 1080p, FSR |
+|---|---|---|---|
+| High | 46.5 FPS (min 42.3) | 42.6 FPS (min 39.0) | 51.3 FPS (min 46.5) |
+| Medium | 49.8 FPS (min 46.4) | 46.1 FPS (min 43.3) | 53.9 FPS (min 50.1) |
+| Low | 57.4 FPS (min 53.8) | 53.0 FPS (min 49.1) | 63.7 FPS (min 57.8) |
+
+1080p was measured with FSR only; with TAAU, expect roughly 8% more there too.
 
 Emulating the mesh shaders costs roughly a quarter to a third of the GPU's time; the rest is the game's own
 rendering. Tips:
 
 - **Use TAAU rather than FSR at 100% render scale.** At native resolution both only anti-alias, and FSR's
-  pass is the heavier one. On the TITAN V at 1440p High, TAAU ran at 46.5 FPS against 43.8 with FSR,
-  about 9% faster at the same GPU clock.
+  pass is the heavier one. On the TITAN V, TAAU was 8-9% faster at every preset at the same GPU clock.
 - **Check that your GPU actually boosts.** On NVIDIA, any app holding a GPU compute context (in testing, a
   photo editor left open) can pin the whole GPU in power state P2 at a reduced clock. On the TITAN V that
   cost about 15%. Check with `nvidia-smi --query-gpu=pstate,clocks.sm --format=csv` while the game runs;
