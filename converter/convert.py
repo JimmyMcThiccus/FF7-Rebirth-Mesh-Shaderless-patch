@@ -2,13 +2,14 @@
 
     python -I convert.py <dump dir> <cache dir>
 
-ABI v7 (see docs/DESIGN.md). For every <ms>_<ps>[...].pair in the dump dir:
+ABI v9: the v7 design (see docs/DESIGN.md) with native 16-bit loads lowered (lower_native16) and a 256 MB
+scratch buffer. For every <ms>_<ps>[...].pair in the dump dir:
   VS mode, when vs_mode_blocker() allows it (thread t writes only vertex t, no cross-thread communication):
-    <cache>/<ms>_<ps>.cs7.dxil   mesh shader as a compute shader that stores only indices + draw arguments
-    <cache>/<ms>_<ps>.vs7.dxil   the mesh shader itself as the vertex shader (convert_ms_to_vs); vertices
+    <cache>/<ms>_<ps>.cs9.dxil   mesh shader as a compute shader that stores only indices + draw arguments
+    <cache>/<ms>_<ps>.vs9.dxil   the mesh shader itself as the vertex shader (convert_ms_to_vs); vertices
                                  never go through scratch
   otherwise the v5 scheme (CS stores packed vertices, generated pass-through VS), under the same names.
-  <cache>/<ms>_<ps>.meta7      "maxVerts maxPrims vertexBytes maxGroups idxRegion" (vertexBytes 0 in VS mode)
+  <cache>/<ms>_<ps>.meta9      "maxVerts maxPrims vertexBytes maxGroups idxRegion" (vertexBytes 0 in VS mode)
   MESHEMU_NO_VS_MODE=1 forces the fallback for every pair (for A/B tests).
 
 Scratch layout for one emulated draw (group G = linear SV_GroupID):
@@ -29,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DXC = os.path.join(HERE, "dxc.exe")
 DXASM = os.path.join(HERE, "dxasm.exe")
 EMU_SPACE = 999
-SCRATCH_CAP = 768 << 20  # must match kScratchCap in proxy.cpp
+SCRATCH_CAP = 256 << 20  # must match kScratchCap in proxy.cpp (indices only in VS mode: 220 MB was the largest draw seen)
 DRAW_ARGS = SCRATCH_CAP  # DrawIndexed arguments for the emulated draw
 TRASH = SCRATCH_CAP + 256
 
@@ -896,9 +897,79 @@ def check_linkage(vs_ll, ps_ll):
 
 # ------------------------------------------------------------------------------------------------
 
+# ------------------------------------------------------------------------------------------------
+# Native 16-bit lowering (GPUs without Native16BitShaderOps, e.g. Pascal)
+# ------------------------------------------------------------------------------------------------
+
+LOWER16_LOADS = ("bufferLoad", "textureLoad", "sample", "sampleLevel", "sampleGrad", "sampleBias", "sampleCmp",
+                 "sampleCmpLevelZero", "textureGather", "textureGatherCmp")
+
+
+def lower_native16(ll):
+    """Rewrite the native 16-bit forms the game's mesh shaders use so they run without native 16-bit support:
+    16-bit-float loads from typed resources (Buffer<half>, textures) become 32-bit loads (the hardware converts
+    the stored format, so values are identical) and their `fpext half -> float` become plain moves. Anything
+    else 16-bit raises ConvertError. Returns ll unchanged when the shader has no 16-bit types."""
+    if not re.search(r"\bhalf\b|\bi16\b", ll):
+        return ll
+    mod = Module(ll)
+    eid, eitems, _ = entry_info(mod)
+    lines = []
+    for ln in mod.lines:
+        if ln.startswith("%dx.types.ResRet.f16 = type") or re.match(r"^declare .*@dx\.op\.\w+\.f16\(", ln):
+            continue  # replaced by the f32 forms below
+        m = re.match(r"^(\s*%[\w.]+) = fpext half (%[\w.]+) to float(.*)$", ln)
+        if m:
+            ln = f"{m.group(1)} = fmul float {m.group(2)}, 1.000000e+00{m.group(3)}"
+        else:
+            ln = re.sub(r"@dx\.op\.(" + "|".join(LOWER16_LOADS) + r")\.f16\(", r"@dx.op.\1.f32(", ln)
+            ln = ln.replace("%dx.types.ResRet.f16", "%dx.types.ResRet.f32")
+            # Typed resource element type F16 (8) -> F32 (9) in handle annotations: props word 1, low byte.
+            ln = re.sub(r"%dx\.types\.ResourceProperties \{ i32 (\d+), i32 (\d+) \}",
+                        lambda mm: "%dx.types.ResourceProperties { i32 " + mm.group(1) + ", i32 " +
+                        str(int(mm.group(2)) + 1 if int(mm.group(2)) & 0xff == 8 else int(mm.group(2))) + " }", ln)
+            # Resource struct type bodies: <N x half> / half -> float (the type names keep "half").
+            m = re.match(r'^(%"?class\.[^=]+ = type )(.*)$', ln)
+            if m:
+                ln = m.group(1) + re.sub(r"\bhalf\b", "float", m.group(2))
+        lines.append(ln)
+    mod.lines = lines
+    mod.md = {}
+    for ln in mod.lines:
+        m = re.match(r"^!(\d+) = (.*)$", ln)
+        if m:
+            mod.md[int(m.group(1))] = m.group(2)
+    # Resource metadata: element type tag {0, 8 (F16)} -> {0, 9 (F32)} on SRV/UAV entries.
+    for i, body in list(mod.md.items()):
+        m = re.match(r"^!\{i32 \d+, .*, !(\d+)\}$", body)
+        if m and "undef" in body and mod.md.get(int(m.group(1))) == "!{i32 0, i32 8}":
+            new = mod.add_md("!{i32 0, i32 9}")
+            mod.set_md(i, body[:body.rfind("!")] + f"!{new}}}")
+    # Shader flags: no longer uses native low precision (0x20).
+    props = md_items(mod.md[md_ref(eitems[4])])
+    for k in range(0, len(props) - 1, 2):
+        if int_val(props[k]) == 0:
+            props[k + 1] = f"i64 {int_val(props[k + 1]) & ~0x20}"
+    mod.set_md(md_ref(eitems[4]), "!{" + ", ".join(props) + "}")
+    ensure_type(mod, "%dx.types.ResRet.f32", "{ float, float, float, float, i32 }")
+    text = mod.text()
+    for op in sorted(set(re.findall(r"@dx\.op\.(\w+)\.f32\(", text))):
+        if op in LOWER16_LOADS and not re.search(rf"^declare .*@dx\.op\.{op}\.f32\(", text, re.M):
+            m = re.search(rf"call %dx\.types\.ResRet\.f32 @dx\.op\.{op}\.f32\(([^)]*)\)", text)
+            args = ", ".join(a.strip().rsplit(" ", 1)[0] for a in m.group(1).split(","))
+            readonly = attr_group(mod, "nounwind readonly")
+            mod.lines.append(f"declare %dx.types.ResRet.f32 @dx.op.{op}.f32({args}) #{readonly}")
+            text = mod.text()
+    body = re.search(r"^define void @[\w.$]+\(\) \{\n(.*?)^\}", text, re.S | re.M).group(1)
+    left = sorted(set(l.strip() for l in body.splitlines() if re.search(r"\bhalf\b|\bi16\b", l)))
+    if left:
+        raise ConvertError("native 16-bit ops other than typed loads: " + left[0][:160])
+    return text
+
+
 def convert_pair(dump, cache, ms, ps, log):
     pair = f"{ms}_{ps}"
-    vs_out = os.path.join(cache, f"{pair}.vs7.dxil")
+    vs_out = os.path.join(cache, f"{pair}.vs9.dxil")
     if os.path.exists(vs_out):
         return
     ps_inputs, ps_ll = None, None
@@ -907,7 +978,7 @@ def convert_pair(dump, cache, ms, ps, log):
         pm = Module(ps_ll)
         _, _, psig = entry_info(pm)
         ps_inputs = parse_sig_elements(pm, md_ref(psig[0]))
-    ms_ll = disassemble(os.path.join(dump, f"{ms}.ms.dxil"))
+    ms_ll = lower_native16(disassemble(os.path.join(dump, f"{ms}.ms.dxil")))
     tmp = vs_out + ".tmp"
 
     # VS mode: index-only CS + the mesh shader itself as the VS. Falls back to the v5 scheme (CS stores the
@@ -915,7 +986,7 @@ def convert_pair(dump, cache, ms, ps, log):
     why = os.environ.get("MESHEMU_NO_VS_MODE") and "disabled" or vs_mode_blocker(ms_ll)
     if why is None:
         try:
-            vs_ll_path = os.path.join(cache, f"{pair}.vs7.ll")
+            vs_ll_path = os.path.join(cache, f"{pair}.vs9.ll")
             with open(vs_ll_path, "w") as f:
                 f.write(convert_ms_to_vs(ms_ll))
             run([DXASM, vs_ll_path, tmp])
@@ -932,13 +1003,13 @@ def convert_pair(dump, cache, ms, ps, log):
     vs_mode = why is None
 
     cs_ll, meta, outputs = convert_ms(ms_ll, ps_inputs, index_only=vs_mode)
-    ll_path = os.path.join(cache, f"{pair}.cs7.ll")
+    ll_path = os.path.join(cache, f"{pair}.cs9.ll")
     with open(ll_path, "w") as f:
         f.write(cs_ll)
-    run([DXASM, ll_path, os.path.join(cache, f"{pair}.cs7.dxil")])
+    run([DXASM, ll_path, os.path.join(cache, f"{pair}.cs9.dxil")])
 
     if not vs_mode:
-        hlsl_path = os.path.join(cache, f"{pair}.vs7.hlsl")
+        hlsl_path = os.path.join(cache, f"{pair}.vs9.hlsl")
         with open(hlsl_path, "w") as f:
             f.write(gen_vs(meta, outputs, ps_inputs))
         run([DXC, "-nologo", "-T", "vs_6_6", "-E", "main", "-O3", hlsl_path, "-Fo", tmp])
@@ -947,7 +1018,7 @@ def convert_pair(dump, cache, ms, ps, log):
             if problems:
                 os.remove(tmp)
                 raise ConvertError("VS/PS linkage mismatch: " + "; ".join(problems))
-    with open(os.path.join(cache, f"{pair}.meta7"), "w") as f:
+    with open(os.path.join(cache, f"{pair}.meta9"), "w") as f:
         f.write("{max_verts} {max_prims} {vertex_bytes} {max_groups} {idx_region}\n".format(**meta))
     os.replace(tmp, vs_out)  # last: its presence marks the pair as converted
     if vs_mode:
@@ -956,7 +1027,27 @@ def convert_pair(dump, cache, ms, ps, log):
         log(f"  {pair}: fallback ({why}): {meta['vertex_bytes']}B/vertex, maxGroups {meta['max_groups']}")
 
 
+def lower16_file(src, dst):
+    """`convert.py --lower16 <in.dxil> <out.dxil>`: any shader (the game's own too) with its native 16-bit
+    loads lowered (lower_native16), validated and signed. Used by the proxy when the GPU rejects a game
+    pipeline for needing native 16-bit ops."""
+    ll = lower_native16(disassemble(src))
+    ll_path = dst + ".ll"
+    with open(ll_path, "w") as f:
+        f.write(ll)
+    run([DXASM, ll_path, dst + ".tmp"])
+    os.replace(dst + ".tmp", dst)
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--lower16":
+        try:
+            lower16_file(os.path.abspath(sys.argv[2]), os.path.abspath(sys.argv[3]))
+            print(f"lowered {os.path.basename(sys.argv[2])}")
+        except ConvertError as e:
+            print(f"FAIL lower16 {os.path.basename(sys.argv[2])}: {e}")
+            sys.exit(1)
+        return
     dump, cache = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
     os.makedirs(cache, exist_ok=True)
     pairs = sorted(f[:-5] for f in os.listdir(dump) if f.endswith(".pair"))

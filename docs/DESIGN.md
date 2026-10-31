@@ -1,7 +1,7 @@
 # meshemu: mesh shader emulation for FF7 Rebirth on GPUs without mesh shaders
 
 > Development notes, kept as written during development. They record every approach that was tried,
-> with its measurements, including those later dropped. The current design is **ABI v7**. Paths like
+> with its measurements, including those later dropped. The current design is **ABI v9** (the v7 draw scheme). Paths like
 > `work\*.csv` and `*.bak` refer to measurement logs and old sources from the development machine;
 > they are not part of this repository. All measurements are from one NVIDIA TITAN V.
 
@@ -102,7 +102,33 @@ same: **neither v5 change helps.** The compute pass is not limited by the bytes 
 instructions it writes; it is the game's own mesh shader math and loads (and the barrier drain in front of
 it). Further converter-side write tweaks are not worth pursuing.
 
-## ABI v7 (current, installed): the mesh shader runs as the vertex shader
+## ABI v9 (current, v0.2.0): v7 plus GPUs without native 16-bit math
+
+Same draw scheme as v7 below. Two changes, from bringing up an NVIDIA Quadro P1000 (Pascal GP107, 4 GB:
+SM 6.8, binding tier 3, but **no native 16-bit shader ops**, no DXR, no VRS):
+
+* **Native 16-bit lowering.** 9 of the 26 game mesh shaders, and one of the game's own particle compute
+  shaders, use 16-bit types, always the same way: `bufferLoad.f16` from a `Buffer<half2/half4>` followed by
+  `fpext half -> float`. On Pascal `CreateComputePipelineState` rejects such shaders with E_INVALIDARG. For
+  the game's own compute shader that left UE with a null PSO and a crash in `RHISetGraphicsPipelineState`
+  (access violation reading 0x10; `ff7rebirth_.exe` +0xc1db06). `lower_native16` in `convert.py` turns
+  those loads into `bufferLoad.f32`, since a typed load converts the stored format, so results are
+  identical. It also turns the `fpext` into a move, fixes the resource element type (metadata and
+  `annotateHandle` properties) and clears the native-low-precision shader flag. Any other 16-bit use raises
+  ConvertError. Mesh shaders are always lowered. For the game's own pipelines the proxy logs every failed
+  creation with each shader's SFI0 feature flags and saves the shaders to `dump\failed\`. If a shader needs
+  native 16-bit ops (flag 0x40000), the proxy runs `convert.py --lower16` on it synchronously (cached in
+  `cache\lower16\<id>.dxil`) and retries the creation. The paired PS of a mesh pipeline is lowered up front
+  when the device lacks 16-bit support.
+* **256 MB scratch** (was 768). In VS mode scratch holds only indices; the largest draw seen is 143k groups,
+  about 220 MB at 128 primitives per group. Draws beyond the cap are clamped, as before.
+
+Cache files are `.cs9/.vs9/.meta9`. P1000 results at the benchmark spot (Lowest, TAA, 1544 MHz, no
+throttling): 24.3 FPS at 1080p / 50% render scale, 28.2 at 720p / 66%. With profiling: 37% of GPU time is
+emulation (per draw cs 51 us + draw 103 us, about 88 draws a frame). That is 4.5 ms of index compute plus
+9.1 ms of emulated draws in a 37 ms frame. VRAM use is about 3.8 of 4 GB.
+
+## ABI v7 (superseded by v9): the mesh shader runs as the vertex shader
 
 Code: `proxy/` and `converter/` (forked from v5; the v6 sources are kept as `proxy_v6.cpp.bak` and
 `convert_v6.py.bak`).

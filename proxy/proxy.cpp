@@ -156,6 +156,8 @@ static void HookSlot(SlotTab& t, void* obj, int slot, void* hook) {
 // Slot indices (from the SDK headers, see vtidx.c).
 enum DevSlot {
     kDevCreateCommandAllocator = 9,
+    kDevCreateGraphicsPipelineState = 10,
+    kDevCreateComputePipelineState = 11,
     kDevCreateCommandList = 12,
     kDevCheckFeatureSupport = 13,
     kDevCreateRootSignature = 16,
@@ -198,6 +200,7 @@ enum ClSlot {
 enum { kAllocReset = 8 };
 enum { kLibStorePipeline = 8, kLibLoadPipeline = 13 };
 
+static SlotTab t_devCreateGraphicsPipelineState, t_devCreateComputePipelineState;
 static SlotTab t_devCreateCommandAllocator, t_devCreateCommandList, t_devCheckFeatureSupport,
     t_devCreateRootSignature, t_devCreateCommandSignature, t_devCreatePipelineLibrary, t_devCreatePipelineState,
     t_devCreateCommandList1;
@@ -531,34 +534,74 @@ static EmuPso* FindEmu(ID3D12PipelineState* pso) {
 static std::mutex g_convMu;
 static bool g_convRunning = false, g_convPending = false;
 
-static void RunConverter() {
+// Runs `python -I tools\convert.py <args>` with output appended to convert.log; returns the exit code
+// (~0u if it could not run).
+static DWORD RunConvertPy(const std::wstring& args, DWORD priority) {
     std::wstring tools = g_dir + L"tools\\";
     std::wstring script = tools + L"convert.py";
     if (GetFileAttributesW(script.c_str()) == INVALID_FILE_ATTRIBUTES) {
         LOG_N(1, "no tools\\convert.py next to the proxy; automatic conversion disabled");
-        return;
+        return ~0u;
     }
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE logf = CreateFileW((g_dir + L"convert.log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    std::wstring cmd = L"python -I \"" + script + L"\" \"" + g_dir + L"dump\" \"" + g_dir + L"cache\"";
+    std::wstring cmd = L"python -I \"" + script + L"\" " + args;
     STARTUPINFOW si = {sizeof(si)};
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = si.hStdError = logf;
     PROCESS_INFORMATION pi = {};
-    ULONGLONG t0 = GetTickCount64();
-    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
-                       nullptr, tools.c_str(), &si, &pi)) {
+    DWORD code = ~0u;
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | priority, nullptr, tools.c_str(),
+                       &si, &pi)) {
         WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD code = 0;
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
-        Log("converter finished (exit %lu, %llu ms)", code, (unsigned long long)(GetTickCount64() - t0));
     } else {
         Log("could not start python for conversion (%lu)", GetLastError());
     }
     if (logf != INVALID_HANDLE_VALUE) CloseHandle(logf);
+    return code;
+}
+
+static void RunConverter() {
+    ULONGLONG t0 = GetTickCount64();
+    DWORD code = RunConvertPy(L"\"" + g_dir + L"dump\" \"" + g_dir + L"cache\"", BELOW_NORMAL_PRIORITY_CLASS);
+    if (code != ~0u)
+        Log("converter finished (exit %lu, %llu ms)", code, (unsigned long long)(GetTickCount64() - t0));
+}
+
+// --- Native 16-bit lowering for the game's own shaders -------------------------------------------
+// GPUs without Native16BitShaderOps (e.g. Pascal) reject pipelines whose shaders use 16-bit types. The game's
+// use is limited to 16-bit-float typed loads, which convert.py --lower16 rewrites as 32-bit loads. Lowered
+// shaders are cached in cache\lower16\<id>.dxil.
+
+static UINT64 ShaderFeatureFlags(const D3D12_SHADER_BYTECODE& bc);
+
+constexpr UINT64 kNeedsNative16 = 0x40000;  // D3D_SHADER_REQUIRES_NATIVE_16BIT_OPS
+static std::atomic<int> g_native16{-1};       // device support (-1 unknown)
+static std::mutex g_lower16Mu;
+
+static bool Needs16(const D3D12_SHADER_BYTECODE* bc) {
+    return bc && bc->pShaderBytecode && bc->BytecodeLength && (ShaderFeatureFlags(*bc) & kNeedsNative16);
+}
+
+static bool Lower16(const D3D12_SHADER_BYTECODE& bc, std::vector<char>& out) {
+    std::lock_guard<std::mutex> lk(g_lower16Mu);
+    std::string id = ShaderId(bc);
+    std::wstring dst = g_dir + L"cache\\lower16\\" + Widen(id) + L".dxil";
+    if (ReadFileBytes(dst, out)) return true;
+    CreateDirectoryW((g_dir + L"cache\\lower16").c_str(), nullptr);
+    CreateDirectoryW((g_dir + L"dump\\lower16").c_str(), nullptr);
+    std::wstring src = g_dir + L"dump\\lower16\\" + Widen(id) + L".dxil";
+    WriteFileBytes(src, bc.pShaderBytecode, bc.BytecodeLength);
+    ULONGLONG t0 = GetTickCount64();
+    bool ok = RunConvertPy(L"--lower16 \"" + src + L"\" \"" + dst + L"\"", NORMAL_PRIORITY_CLASS) == 0 &&
+              ReadFileBytes(dst, out);
+    Log("lowered native 16-bit shader %s: %s (%llu ms)", id.c_str(), ok ? "ok" : "FAILED, see convert.log",
+        (unsigned long long)(GetTickCount64() - t0));
+    return ok;
 }
 
 static void RequestConvert() {
@@ -598,9 +641,9 @@ static bool BuildEmu(EmuPso* e, ID3D12Device2* dev, const char** why) {
     std::vector<char> csBytes, vsBytes, metaBytes;
     std::wstring cache = g_dir + L"cache\\";
     if (e->amplification) { *why = "amplification shader"; return false; }
-    if (!ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".cs7.dxil", csBytes) ||
-        !ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".vs7.dxil", vsBytes) ||
-        !ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".meta7", metaBytes)) {
+    if (!ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".cs9.dxil", csBytes) ||
+        !ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".vs9.dxil", vsBytes) ||
+        !ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".meta9", metaBytes)) {
         *why = "not converted";
         return false;
     }
@@ -671,6 +714,123 @@ static bool TryLateBuild(EmuPso* e) {
     return ok;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Diagnostics: pipelines the game creates that the driver rejects (e.g. shaders needing a GPU feature the
+// card lacks). Logged with each shader's required-feature flags; the shaders are saved to dump\failed\.
+// ---------------------------------------------------------------------------------------------
+
+// D3D_SHADER_REQUIRES_* flags from the container's SFI0 part (0 if absent).
+static UINT64 ShaderFeatureFlags(const D3D12_SHADER_BYTECODE& bc) {
+    const unsigned char* p = (const unsigned char*)bc.pShaderBytecode;
+    if (!p || bc.BytecodeLength < 32 || memcmp(p, "DXBC", 4) != 0) return 0;
+    UINT32 parts = *(const UINT32*)(p + 28);
+    for (UINT32 i = 0; i < parts && 32 + 4 * (i + 1) <= bc.BytecodeLength; i++) {
+        UINT32 off = *(const UINT32*)(p + 32 + 4 * i);
+        if (off + 16 > bc.BytecodeLength) continue;
+        if (memcmp(p + off, "SFI0", 4) == 0) return *(const UINT64*)(p + off + 8);
+    }
+    return 0;
+}
+
+static void ReportFailedShader(std::string& line, const char* stage, const D3D12_SHADER_BYTECODE* bc) {
+    if (!bc || !bc->pShaderBytecode || !bc->BytecodeLength) return;
+    std::string id = ShaderId(*bc);
+    char buf[160];
+    snprintf(buf, sizeof(buf), " %s=%s(flags %llx)", stage, id.c_str(), (unsigned long long)ShaderFeatureFlags(*bc));
+    line += buf;
+    std::wstring dir = g_dir + L"dump\\failed\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    WriteFileBytes(dir + Widen(id) + L"." + Widen(stage) + L".dxil", bc->pShaderBytecode, bc->BytecodeLength);
+}
+
+static void ReportFailedStream(const StreamView& sv, HRESULT hr) {
+    static const struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; const char* name; } stages[] = {
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, "vs"}, {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, "hs"},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, "ds"}, {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, "gs"},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, "ps"}, {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, "cs"}};
+    std::string line;
+    for (auto& s : stages) ReportFailedShader(line, s.name, sv.shader(s.t));
+    LOG_N(300, "game pipeline creation failed %08x (stream):%s", hr, line.c_str());
+}
+
+// Copies the stream with every shader that needs native 16-bit ops replaced by its lowered version (kept alive
+// in `keep`). Returns false if there was nothing to lower.
+static bool LowerStream16(const StreamView& sv, StreamBuilder& b, std::vector<std::vector<char>>& keep) {
+    bool any = false;
+    keep.reserve(16);
+    for (auto& it : sv.items) {
+        switch (it.type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: {
+            auto bc = &((const SubObj<D3D12_SHADER_BYTECODE>*)it.ptr)->inner;
+            if (Needs16(bc)) {
+                keep.emplace_back();
+                if (Lower16(*bc, keep.back())) {
+                    b.add(it.type, D3D12_SHADER_BYTECODE{keep.back().data(), keep.back().size()});
+                    any = true;
+                    continue;
+                }
+            }
+            break;
+        }
+        default: break;
+        }
+        b.raw(it.ptr, it.size);
+    }
+    return any;
+}
+
+static HRESULT STDMETHODCALLTYPE Hk_CreateGraphicsPipelineState(ID3D12Device* self, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,
+                                                                REFIID riid, void** out) {
+    auto orig = ORIG(t_devCreateGraphicsPipelineState, self, decltype(&Hk_CreateGraphicsPipelineState));
+    HRESULT hr = orig(self, d, riid, out);
+    if (FAILED(hr) && d) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC nd = *d;
+        std::vector<char> low[5];
+        D3D12_SHADER_BYTECODE* bcs[5] = {&nd.VS, &nd.HS, &nd.DS, &nd.GS, &nd.PS};
+        bool any = false;
+        for (int i = 0; i < 5; i++)
+            if (Needs16(bcs[i]) && Lower16(*bcs[i], low[i])) {
+                *bcs[i] = {low[i].data(), low[i].size()};
+                any = true;
+            }
+        if (any) {
+            hr = orig(self, &nd, riid, out);
+            LOG_N(300, "game graphics pipeline retried with 16-bit-lowered shaders -> %08x", hr);
+            if (SUCCEEDED(hr)) return hr;
+        }
+        std::string line;
+        ReportFailedShader(line, "vs", &d->VS);
+        ReportFailedShader(line, "hs", &d->HS);
+        ReportFailedShader(line, "ds", &d->DS);
+        ReportFailedShader(line, "gs", &d->GS);
+        ReportFailedShader(line, "ps", &d->PS);
+        LOG_N(300, "game pipeline creation failed %08x (graphics):%s", hr, line.c_str());
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hk_CreateComputePipelineState(ID3D12Device* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* d,
+                                                               REFIID riid, void** out) {
+    auto orig = ORIG(t_devCreateComputePipelineState, self, decltype(&Hk_CreateComputePipelineState));
+    HRESULT hr = orig(self, d, riid, out);
+    if (FAILED(hr) && d) {
+        std::vector<char> low;
+        if (Needs16(&d->CS) && Lower16(d->CS, low)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC nd = *d;
+            nd.CS = {low.data(), low.size()};
+            hr = orig(self, &nd, riid, out);
+            LOG_N(300, "compute pipeline retried with a 16-bit-lowered shader -> %08x", hr);
+            if (SUCCEEDED(hr)) return hr;
+        }
+        std::string line;
+        ReportFailedShader(line, "cs", &d->CS);
+        LOG_N(300, "compute pipeline creation failed %08x:%s", hr, line.c_str());
+    }
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE Hk_CreatePipelineState(ID3D12Device2* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                                         REFIID riid, void** out) {
     auto orig = ORIG(t_devCreatePipelineState, self, decltype(&Hk_CreatePipelineState));
@@ -680,7 +840,21 @@ static HRESULT STDMETHODCALLTYPE Hk_CreatePipelineState(ID3D12Device2* self, con
         return orig(self, desc, riid, out);
     }
     auto msBc = sv.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS);
-    if (!msBc) return orig(self, desc, riid, out);
+    if (!msBc) {
+        HRESULT hr = orig(self, desc, riid, out);
+        if (FAILED(hr)) {
+            StreamBuilder b;
+            std::vector<std::vector<char>> keep;
+            if (LowerStream16(sv, b, keep)) {
+                auto nd = b.desc();
+                HRESULT hr2 = orig(self, &nd, riid, out);
+                LOG_N(300, "game pipeline retried with 16-bit-lowered shaders -> %08x", hr2);
+                if (SUCCEEDED(hr2)) return hr2;
+            }
+            ReportFailedStream(sv, hr);
+        }
+        return hr;
+    }
 
     auto psBc = sv.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS);
     auto asBc = sv.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS);
@@ -695,6 +869,10 @@ static HRESULT STDMETHODCALLTYPE Hk_CreatePipelineState(ID3D12Device2* self, con
         if (e->rs) e->rs->AddRef();  // kept for late builds
     }
     if (psBc) e->psBytes.assign((const char*)psBc->pShaderBytecode, (const char*)psBc->pShaderBytecode + psBc->BytecodeLength);
+    if (psBc && g_native16.load() == 0 && Needs16(psBc)) {
+        std::vector<char> low;
+        if (Lower16(*psBc, low)) e->psBytes = low;  // the emulated pipeline pairs it with our VS
+    }
 
     // Null pipeline for the app; base stream kept for building the emulated one.
     StreamBuilder base;
@@ -933,7 +1111,7 @@ static void STDMETHODCALLTYPE Hk_ClExecuteIndirect(List* self, ID3D12CommandSign
 // Emulation resources (one set per process; the game has a single device)
 // ---------------------------------------------------------------------------------------------
 
-constexpr UINT64 kScratchCap = 768ull << 20;  // usable scratch; groups beyond it are dropped
+constexpr UINT64 kScratchCap = 256ull << 20;  // usable scratch (must match convert.py); groups beyond it are dropped
 constexpr UINT64 kScratchTrash = 1ull << 20;  // writes of dropped groups land here
 constexpr UINT64 kDrawArgs = kScratchCap;    // DrawIndexed arguments written by the converted CS (ABI v3)
 constexpr UINT kUploadSlots = 4096;            // dispatch sizes for direct DispatchMesh calls (16 bytes each)
@@ -1395,6 +1573,24 @@ static void HookDevice(void* obj) {
     HookSlot(t_devCreateCommandSignature, d, kDevCreateCommandSignature, (void*)&Hk_CreateCommandSignature);
     HookSlot(t_devCreatePipelineLibrary, d, kDevCreatePipelineLibrary, (void*)&Hk_CreatePipelineLibrary);
     HookSlot(t_devCreatePipelineState, d, kDevCreatePipelineState, (void*)&Hk_CreatePipelineState);
+    HookSlot(t_devCreateGraphicsPipelineState, d, kDevCreateGraphicsPipelineState, (void*)&Hk_CreateGraphicsPipelineState);
+    HookSlot(t_devCreateComputePipelineState, d, kDevCreateComputePipelineState, (void*)&Hk_CreateComputePipelineState);
+
+    // What the GPU lacks that game shaders may need (the patch only fills in mesh shaders).
+    static std::once_flag once;
+    std::call_once(once, [d] {
+        D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_8};
+        if (FAILED(d->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) sm.HighestShaderModel = (D3D_SHADER_MODEL)0;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {};
+        d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4));
+        g_native16 = o4.Native16BitShaderOpsSupported ? 1 : 0;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
+        d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {};
+        d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6));
+        Log("GPU: shader model %x, native 16-bit ops %d, raytracing tier %x, VRS tier %d", sm.HighestShaderModel,
+            o4.Native16BitShaderOpsSupported, o5.RaytracingTier, o6.VariableShadingRateTier);
+    });
     d->Release();
 }
 

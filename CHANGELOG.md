@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.0-beta (2026-10-31): Pascal and earlier GPUs
+
+- Runs on GPUs without native 16-bit shader math, such as Pascal; tested on an NVIDIA Quadro P1000. Before,
+  the game crashed with "Fatal error" while loading on these GPUs, because a particle compute shader of its
+  own could not be created, and 9 of the 26 mesh shaders stayed invisible.
+  - The converter rewrites 16-bit-float typed buffer loads as 32-bit loads (identical results), so all mesh
+    shaders convert for every GPU.
+  - When the GPU rejects one of the game's own pipelines for needing native 16-bit math, the patch rewrites
+    the shader (`convert.py --lower16`, cached in `meshemu\cache\lower16`) and retries.
+- The working buffer shrank from 768 MB to 256 MB of VRAM, which matters on 4 GB cards. It now only holds
+  triangle indices; the largest draw seen needs about 220 MB.
+- Diagnostics: every pipeline the GPU rejects is logged in `meshemu.log` with its shaders' required-feature
+  flags, and the shaders are saved to `meshemu\dump\failed\`. The GPU's shader model, 16-bit, ray tracing
+  and VRS support are logged at startup.
+- The converted shader cache moved to a new format (`*.cs9/.vs9/.meta9`); older cache files are ignored and
+  shaders are reconverted once.
+- Performance on the P1000 (Lowest, TAA): 24 FPS at 1080p with 50% render scale, 28 FPS at 720p with 66%.
+
 ## v0.1.0-beta (2026-10-30)
 
 First public beta.

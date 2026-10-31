@@ -7,8 +7,10 @@ start on older GPUs. This patch is a drop-in `d3d12.dll` that sits next to the g
 support to the game and translates every mesh shader draw into compute and vertex shader work that older GPUs
 can run. The game's files are not modified.
 
-> **Status: v0.1.0 beta.** Developed and tested on one GPU, an NVIDIA TITAN V. Other GPUs that meet the
-> requirements below should work in principle but are untested. Reports are welcome in the issues.
+> **Status: v0.2.0 beta.** Tested on an NVIDIA TITAN V (Volta) and an NVIDIA Quadro P1000 (Pascal). Since
+> v0.2.0 the patch also works on GPUs without native 16-bit shader math, such as Pascal; older generations
+> should benefit too but are untested. Other GPUs that meet the requirements below should work in principle.
+> Reports are welcome in the issues.
 
 ## Requirements
 
@@ -16,7 +18,8 @@ can run. The game's files are not modified.
 - A DirectX 12 GPU with **feature level 12_1**, **Shader Model 6.6** and **resource binding tier 3**, with a
   current driver. The patch only fills in mesh shaders: if the game needs another feature your GPU lacks, it
   will still not run.
-- About **800 MB of VRAM** on top of what the game uses (the patch's working buffer).
+- About **300 MB of VRAM** on top of what the game uses (the patch's working buffer). A 4 GB card runs the
+  game at the lowest settings, with little memory to spare.
 - **Python 3.8 or newer** installed and on PATH as `python` ([python.org](https://www.python.org/downloads/),
   tick "Add python.exe to PATH"). The patch converts the game's shaders in the background with it.
 - An internet connection during install: the installer downloads Microsoft's
@@ -71,6 +74,16 @@ scale, GPU at about 1650 MHz:
 
 1080p was measured with FSR only; with TAAU, expect roughly 8% more there too.
 
+NVIDIA Quadro P1000 (Pascal, 4 GB), same spot, Lowest preset, TAA, GPU at 1544 MHz:
+
+| Resolution | Render scale | FPS |
+|---|---|---|
+| 1080p | 50% | 24.3 (min 22.3) |
+| 720p | 66% | 28.2 (min 25.6) |
+
+On the P1000 about 16 ms of each frame does not shrink with resolution, and VRAM use sits at about 3.8 of
+4 GB.
+
 Emulating the mesh shaders costs roughly a quarter to a third of the GPU's time; the rest is the game's own
 rendering. Tips:
 
@@ -83,6 +96,8 @@ rendering. Tips:
 - Keep the GPU cool. Under this load the TITAN V reaches its temperature limit and throttles unless the fan
   curve is raised.
 - Lower resolution helps more than lower presets: about 40% of a frame scales with resolution.
+- On 4 GB cards, keep texture and other memory-heavy settings at their lowest: the game alone nearly fills
+  the card.
 
 ## Troubleshooting
 
@@ -93,6 +108,9 @@ rendering. Tips:
 - Geometry missing for good: check that `python` works in a new command prompt and that `convert.log`
   shows conversions. Shaders the patch cannot convert (amplification shaders, per-primitive outputs) are
   logged and skipped. The game builds tested so far do not use them.
+- The game crashes while loading with a "Fatal error": look for `pipeline creation failed` lines in
+  `meshemu.log`. They name each shader the GPU rejected and its required-feature flags, and the shaders are
+  saved to `meshemu\dumpailed\`. Please attach both to an issue.
 - Creating an empty file `meshemu\profile.txt` before launching adds GPU timings of the emulated draws to
   `meshemu.log` every few seconds.
 
@@ -104,6 +122,11 @@ rendering. Tips:
   the DXIL level and re-signed with Microsoft's validator. The game's mesh shaders compute vertex t and
   primitive t in thread t without sharing data between threads. So the shader itself can run as the
   **vertex shader**, and a small compute shader version writes only the triangle indices.
+- **16-bit shader math** (GPUs without native 16-bit support, such as Pascal): some of the game's shaders,
+  mesh shaders and one particle compute shader, read 16-bit floats from typed buffers. The converter
+  rewrites those reads as 32-bit reads; the GPU converts the stored values on load, so results are
+  identical. When the GPU rejects one of the game's own pipelines for this reason, the patch rewrites the
+  shader with `convert.py --lower16` (cached in `meshemu\cache\lower16`) and retries.
 - **Draw translation** (`proxy/proxy.cpp`): every `DispatchMesh` / `ExecuteIndirect(DISPATCH_MESH)` becomes
   "index compute pass, barrier, indexed draw" using the game's own indirect arguments, with the game's
   root arguments replayed for the compute pass.
