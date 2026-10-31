@@ -1,0 +1,20 @@
+# build outputs
+*.exe
+*.dll
+*.obj
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.dxil
+*.cso
+proxy/nullvs.h
+tests/ms_*.h
+tests/ps_*.h
+*.rgba
+__pycache__/
+third_party/
+dist/
+# never commit shaders dumped from or converted for the game
+meshemu/
+*.ll
