@@ -1,4 +1,5 @@
 # FF7:Rebirth Mesh-Shaderless patch
+Initially made by JamieTheAnything with assistance with Claude, any further commits/merges/Forks should be made and authored by people. 
 
 Play **FINAL FANTASY VII REBIRTH** (PC) on a DirectX 12 GPU **without mesh shader support**.
 
