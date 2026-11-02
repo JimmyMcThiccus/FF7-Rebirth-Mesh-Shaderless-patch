@@ -15,7 +15,9 @@ can run. The game's files are not modified.
 
 ## Requirements
 
-- Windows 10 or 11, 64-bit, and the Steam or Epic PC version of FINAL FANTASY VII REBIRTH.
+- Windows 11, or Windows 10 version 22H2, 64-bit, and the Steam or Epic PC version of FINAL FANTASY VII
+  REBIRTH. Older Windows 10 releases (1909 and earlier) have a D3D12 runtime that predates DX12 Ultimate and
+  fail at startup with `CreateCommandSignature ... E_INVALIDARG`.
 - A DirectX 12 GPU with **feature level 12_1**, **Shader Model 6.6** and **resource binding tier 3**, with a
   current driver. The patch only fills in mesh shaders: if the game needs another feature your GPU lacks, it
   will still not run.
