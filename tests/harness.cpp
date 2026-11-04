@@ -248,5 +248,8 @@ int main(int argc, char** argv) {
     UINT covered = 0;
     for (UINT i = 0; i < W * H; i++) covered += ((const UINT*)px)[i] != 0xff000000u;
     printf("covered pixels: %u / %u\n", covered, W * H);
+    // HARNESS_LINGER_MS=<n>: stay alive so the proxy's background converter (started at device creation) can
+    // run, as it does in the game; the next run then finds the conversion without an explicit converter call.
+    if (const char* ms = getenv("HARNESS_LINGER_MS")) Sleep((DWORD)atoi(ms));
     return 0;
 }

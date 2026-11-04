@@ -5,9 +5,10 @@
 #   -DxcDir   folder that already has dxc.exe, dxcompiler.dll and dxil.dll (else the pinned DXC release is
 #             downloaded into third_party\dxc once)
 #
-# Needs Visual Studio 2022+ with "Desktop development with C++" (x64 tools, Windows SDK) and Python 3.8+.
-# Output: proxy\d3d12.dll, converter\dxasm.exe (+ DXC copied next to convert.py for tests\run.sh), and
-# dist\FF7R-Mesh-Shaderless-patch-<version>.zip.
+# Needs Visual Studio 2022+ with "Desktop development with C++" (x64 tools, Windows SDK), Rust (cargo, the
+# x86_64-pc-windows-msvc target) and Python 3.8+ (build and test scripts only; players do not need it).
+# Output: proxy\d3d12.dll, conv\target\release\meshemu-conv.exe, converter\dxasm.exe (+ DXC copied next to
+# convert.py for tests\run.sh), and dist\FF7R-Mesh-Shaderless-patch-<version>.zip.
 param([string]$DxcDir)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -23,6 +24,8 @@ foreach ($script in 'proxy\build.cmd', 'converter\build.cmd') {
     & cmd /c "`"$(Join-Path $root $script)`""
     if ($LASTEXITCODE) { throw "$script failed" }
 }
+& cargo build --release --manifest-path (Join-Path $root 'conv\Cargo.toml')
+if ($LASTEXITCODE) { throw 'cargo build (conv) failed' }
 
 $name = "FF7R-Mesh-Shaderless-patch-$version"
 $dist = Join-Path $root 'dist'
@@ -34,7 +37,7 @@ foreach ($f in 'install.ps1', 'uninstall.ps1', 'get-dxc.ps1', 'find-game.ps1', '
                'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md') {
     Copy-Item (Join-Path $root $f) $out
 }
-Copy-Item (Join-Path $root 'converter\convert.py'), (Join-Path $root 'converter\dxasm.exe') (Join-Path $out 'tools')
+Copy-Item (Join-Path $root 'conv\target\release\meshemu-conv.exe') (Join-Path $out 'tools')
 $zip = Join-Path $dist "$name.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $out -DestinationPath $zip

@@ -19,6 +19,14 @@ They are licensed under the terms in that release's license files.
 `converter/dxasm.cpp` (part of this project) loads `dxcompiler.dll` and `dxil.dll` at run time through
 their public `DxcCreateInstance` interface. It includes `dxcapi.h` from the Windows SDK.
 
+## DirectMesh (lonewolf0622)
+
+Splitting a mesh draw that overflows the working buffer into an ordered series of draws, rather than
+dropping the overflow, follows the overflow handling of the index route in
+[DirectMesh](https://github.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-), lonewolf0622's mesh shader
+support for AMD BC-250 / RDNA 1 in Mesa's RADV driver (MIT license), used with the author's permission.
+Only the idea was used; no code from that project is included.
+
 ## Windows SDK / Direct3D 12
 
 The proxy is built against the Windows SDK headers and forwards to the system `d3d12.dll`.

@@ -1,7 +1,7 @@
 # meshemu: mesh shader emulation for FF7 Rebirth on GPUs without mesh shaders
 
 > Development notes, kept as written during development. They record every approach that was tried,
-> with its measurements, including those later dropped. The current design is **ABI v9** (the v7 draw scheme). Paths like
+> with its measurements, including those later dropped. The current design is **ABI v10** (the v7 draw scheme). Paths like
 > `work\*.csv` and `*.bak` refer to measurement logs and old sources from the development machine;
 > they are not part of this repository. All measurements are from one NVIDIA TITAN V.
 
@@ -102,7 +102,41 @@ same: **neither v5 change helps.** The compute pass is not limited by the bytes 
 instructions it writes; it is the game's own mesh shader math and loads (and the barrier drain in front of
 it). Further converter-side write tweaks are not worth pursuing.
 
-## ABI v9 (current, v0.2.0): v7 plus GPUs without native 16-bit math
+## ABI v10 (current, unreleased): oversized direct draws are split instead of clamped
+
+Same draw scheme as v9. Until v9 a draw with more groups than fit in scratch (`maxGroups`, from the 256 MB
+cap) was clamped: groups past the cap wrote to the trash range and their geometry was missing. The idea of
+continuing an overflowing draw in order instead of dropping it comes from lonewolf0622's DirectMesh for
+RADV (BC-250 / RDNA1, MIT), whose index route turns pool overflow into an ordered suffix of draws. No code
+was taken from it.
+
+* **Group offset.** The proxy appends one more root parameter to every rewritten root signature, graphics
+  and compute variant: 3 root constants `{ox, oy, oz}` at `b0 space999` (the budget check is now
+  `cost + 3*2 + 3 <= 64` DWORDs). `add_group_offset` in `convert.py` declares the matching cbuffer in both
+  converted shaders. In the cs, scratch addressing, the degenerate fill and the DrawIndexed arguments stay
+  chunk-local (raw `SV_GroupID` and the chunk dims). Every `groupId` the game's own code reads gets `o`
+  added, and every `threadId` gets `o * numthreads`. In the VS, the group coordinates split from
+  `SV_VertexID` by the chunk dims get `o` added. All 32 game pairs read `SV_GroupID`, so without the offset a
+  split draw would fetch the wrong meshlets.
+* **Chunking** (`Hk_ClDispatchMesh`). When `x*y*z > maxGroups` the dispatch is cut into whole xy slices
+  (`cz = maxGroups / (x*y)`). If one slice is too big it is cut into x rows, and if one row is too big,
+  into x runs of `maxGroups`. Each chunk gets its own upload slot with the chunk dims, its offset constants,
+  a cs dispatch, the scratch transition and a DrawIndexedInstanced of `chunkGroups * maxPrims * 3`. The log
+  line `DispatchMesh ... exceeds scratch (...): split into N chunks of AxBxC` replaces the old
+  `exceeds scratch, clamped`. Draws that fit run exactly as before (one chunk, offset 0).
+* **ExecuteIndirect is not split.** Its group count lives in a GPU buffer, so splitting it would need GPU-side
+  argument rewriting. Indirect draws set the offset to 0 and still clamp at `maxGroups`. The largest draw seen
+  in the game (143k groups, about 220 MB) fits, so this has not been hit in practice.
+* **Testing.** `MESHEMU_TEST_MAX_GROUPS=<n>` caps `maxGroups` in the converter, which forces the harness's
+  9x9-group scene into chunks: n=20 gives 5 chunks of 9x2x1 (y rows), n=4 gives 27 of 4x1x1 (x runs). Both
+  shader shapes (`HARNESS_MS_GAME=1` VS mode, and the fallback) match WARP in `direct` and `multi`. As a
+  negative control, `indirect` with n=4 loses 48,581 pixels, which shows the comparison catches dropped
+  groups. The z-slice split has no harness case, because the test scene is a single z layer. All 32 game
+  pairs convert and validate under v10.
+
+Cache files are `.cs10/.vs10/.meta10`; v9 caches are ignored and reconverted once.
+
+## ABI v9 (superseded by v10, v0.2.0): v7 plus GPUs without native 16-bit math
 
 Same draw scheme as v7 below. Two changes, from bringing up an NVIDIA Quadro P1000 (Pascal GP107, 4 GB:
 SM 6.8, binding tier 3, but **no native 16-bit shader ops**, no DXR, no VRS):
@@ -121,7 +155,8 @@ SM 6.8, binding tier 3, but **no native 16-bit shader ops**, no DXR, no VRS):
   `cache\lower16\<id>.dxil`) and retries the creation. The paired PS of a mesh pipeline is lowered up front
   when the device lacks 16-bit support.
 * **256 MB scratch** (was 768). In VS mode scratch holds only indices; the largest draw seen is 143k groups,
-  about 220 MB at 128 primitives per group. Draws beyond the cap are clamped, as before.
+  about 220 MB at 128 primitives per group. Draws beyond the cap are clamped, as before (v10 splits direct
+  ones instead).
 
 Cache files are `.cs9/.vs9/.meta9`. P1000 results at the benchmark spot (Lowest, TAA, 1544 MHz, no
 throttling): 24.3 FPS at 1080p / 50% render scale, 28.2 at 720p / 66%. With profiling: 37% of GPU time is
@@ -347,12 +382,15 @@ on WARP (real mesh shaders, system d3d12.dll) and on the Titan V through the pro
 `HARNESS_FL122=1` exercises the 12_2 spoof. `HARNESS_MS_GAME=1` uses `ms_game.hlsl` (shaped like the game's
 mesh shaders, so the converter takes VS mode); without it `ms_simple.hlsl` exercises the v5-style fallback.
 `HARNESS_WIDE=1` pairs the mesh shader with `ps_wide.hlsl` (16-byte vertex units; with `HARNESS_MS_GAME=1`
-it also exercises the VS/PS linkage fallback).
+it also exercises the VS/PS linkage fallback). `MESHEMU_TEST_MAX_GROUPS=<n>` caps maxGroups in the converter
+so direct draws are split into chunks (ABI v10).
 
 ## Not handled yet
 
 * Amplification shaders, `StorePrimitiveOutput`, mesh payloads (converter rejects them -> null pipeline).
 * `SV_PrimitiveID` read by a PS (would be the system value of the VS path).
+* `ExecuteIndirect(DISPATCH_MESH)` with more groups than `maxGroups` is clamped (direct draws are split
+  since v10).
 * Batching (ABI v6) still pays 2 barriers per *batch*; a batch ends at any non-mesh command, so passes that
   interleave mesh draws with barriers or state the proxy does not snapshot get no overlap. Size prediction
   loses geometry for one frame when a draw grows past its reservation, and a key whose argument address

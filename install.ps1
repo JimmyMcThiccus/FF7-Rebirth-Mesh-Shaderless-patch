@@ -11,34 +11,19 @@ $here = $PSScriptRoot
 . (Join-Path $here 'get-dxc.ps1')
 . (Join-Path $here 'find-game.ps1')
 
-function Get-Python {
-    foreach ($cmd in 'python', 'py') {
-        if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { continue }
-        try {
-            $v = & $cmd -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-            if ("$v" -match '^3\.(\d+)$' -and [int]$Matches[1] -ge 8) { return $cmd }
-        } catch {}
-    }
-    return $null
-}
-
 Write-Host 'FF7 Rebirth Mesh-Shaderless patch installer' -ForegroundColor Cyan
 
 $Game = Resolve-Game $Game
 Write-Host "Game: $Game"
 Assert-GameClosed
 
-# The proxy runs the shader converter with "python" in the background.
-$py = Get-Python
-if ($py -ne 'python') {
-    throw ('Python 3.8 or newer must be installed and on PATH as "python" (https://www.python.org/downloads/, ' +
-           'tick "Add python.exe to PATH"). The Microsoft Store "python" alias without Python installed does not work.')
-}
-
+# The proxy runs tools\meshemu-conv.exe (self-contained; it loads DXC's dxcompiler.dll and dxil.dll next to it).
 $meshemu = Join-Path $Game 'meshemu'
 $tools = Join-Path $meshemu 'tools'
 New-Item -ItemType Directory -Force $tools | Out-Null
-Copy-Item (Join-Path $here 'tools\convert.py'), (Join-Path $here 'tools\dxasm.exe') $tools -Force
+Copy-Item (Join-Path $here 'tools\meshemu-conv.exe') $tools -Force
+# The Python converter of v0.2.0 and earlier; the proxy prefers the exe, so these would only be confusing.
+foreach ($old in 'convert.py', 'dxasm.exe') { Remove-Item (Join-Path $tools $old) -ErrorAction SilentlyContinue }
 Install-Dxc $tools $DxcDir
 Write-Host "Converter tools -> $tools"
 
@@ -59,6 +44,6 @@ Copy-Item (Join-Path $here 'd3d12.dll') $dll -Force
 Write-Host "Patch DLL -> $dll"
 
 Write-Host ''
-Write-Host 'Installed. On the first launch (and in new areas) some geometry is missing for a few seconds while' -ForegroundColor Green
-Write-Host 'the mesh shaders are converted in the background; it appears without a restart.' -ForegroundColor Green
+Write-Host 'Installed. On the first launch, and after game updates, the game''s mesh shaders are converted in the' -ForegroundColor Green
+Write-Host 'background (seconds to a minute, depending on the CPU); geometry missing meanwhile appears without a restart.' -ForegroundColor Green
 Write-Host "Logs: $meshemu\meshemu.log and convert.log. Uninstall: uninstall.ps1"

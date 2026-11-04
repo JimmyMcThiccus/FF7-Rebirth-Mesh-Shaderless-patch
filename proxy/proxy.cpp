@@ -214,12 +214,14 @@ static SlotTab t_allocReset, t_libStorePipeline, t_libLoadPipeline;
 // ---------------------------------------------------------------------------------------------
 
 constexpr UINT kEmuSpace = 999;
+constexpr UINT kEmuOffDwords = 3;
 
 struct RsInfo {
     UINT numParams = 0;   // as seen by the app
     int emuUav = -1;      // index of appended root UAV (u0, space 999)
     int emuArgs = -1;     // index of appended root SRV (t1, space 999): dispatch size {x, y, z} for the CS
     int emuSrv = -1;      // index of appended root SRV (t0, space 999): scratch as read by the VS
+    int emuOff = -1;      // index of appended root constants (b0, space 999): group offset {ox, oy, oz} (ABI v10)
     // Same parameter layout with mesh/ALL params visible to compute and other stage-only params turned into
     // placeholders, so graphics root arguments can be replayed by index for the mesh-as-compute dispatch.
     ID3D12RootSignature* compute = nullptr;
@@ -336,7 +338,7 @@ static ID3DBlob* RewriteRootSignature(const void* blob, SIZE_T len, RsInfo& info
 
     D3D12_ROOT_SIGNATURE_FLAGS flags = d.Flags & ~(D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS |
                                                    D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS);
-    if (cost + 3 * 2 <= 64) {
+    if (cost + 3 * 2 + kEmuOffDwords <= 64) {
         D3D12_ROOT_PARAMETER1 uav = {};
         uav.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
         uav.Descriptor = {0, kEmuSpace, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
@@ -354,6 +356,13 @@ static ID3DBlob* RewriteRootSignature(const void* blob, SIZE_T len, RsInfo& info
         info.emuArgs = (int)params.size();
         params.push_back(argsSrv);
         cparams.push_back(argsSrv);
+        D3D12_ROOT_PARAMETER1 off = {};
+        off.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        off.Constants = {0, kEmuSpace, kEmuOffDwords};
+        off.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        info.emuOff = (int)params.size();
+        params.push_back(off);
+        cparams.push_back(off);
         D3D12_ROOT_SIGNATURE_FLAGS cflags = d.Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
                                                         D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
         *computeBlob = Serialize({(UINT)cparams.size(), cparams.data(), (UINT)csamplers.size(), csamplers.data(), cflags});
@@ -383,8 +392,8 @@ static HRESULT STDMETHODCALLTYPE Hk_CreateRootSignature(ID3D12Device* self, UINT
         cb->Release();
     }
     if (nb) {
-        LOG_N(50, "rewrote mesh root signature (%u params, emu uav %d srv %d args %d, compute %p) -> %08x",
-              info.numParams, info.emuUav, info.emuSrv, info.emuArgs, info.compute, hr);
+        LOG_N(50, "rewrote mesh root signature (%u params, emu uav %d srv %d args %d off %d, compute %p) -> %08x",
+              info.numParams, info.emuUav, info.emuSrv, info.emuArgs, info.emuOff, info.compute, hr);
         nb->Release();
     }
     if (SUCCEEDED(hr) && out && *out) {
@@ -503,6 +512,7 @@ struct EmuPso {
     std::atomic<bool> ready{false};     // cs + gfx built
     std::atomic<bool> building{false};
     std::atomic<ULONGLONG> nextTry{0};
+    std::atomic<bool> noPrecache{false};  // the precached conversion failed here: wait for the per-pair one
     bool amplification = false;
     ID3D12PipelineState* cs = nullptr;  // converted mesh shader
     ID3D12PipelineState* gfx = nullptr; // generated VS + original PS
@@ -511,7 +521,7 @@ struct EmuPso {
     UINT maxPrims = 0;
     UINT maxGroups = 0;                 // groups that fit in scratch (see converter, ABI v2)
     UINT idxRegion = 0;                 // bytes of the index region at the start of scratch
-    int emuUav = -1, emuSrv = -1, emuArgs = -1;  // root parameter indices in rs
+    int emuUav = -1, emuSrv = -1, emuArgs = -1, emuOff = -1;  // root parameter indices in rs
     std::string ms, ps;
     std::vector<char> baseStream;       // app subobjects minus MS/AS/PS/VS/CACHED_PSO/topology
     std::vector<char> psBytes;
@@ -528,25 +538,35 @@ static EmuPso* FindEmu(ID3D12PipelineState* pso) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Background shader conversion: meshemu\tools\convert.py dump -> cache whenever a new pipeline is dumped.
+// Background shader conversion: meshemu\tools\meshemu-conv.exe (or convert.py) dump -> cache whenever a new
+// pipeline is dumped, after a once-per-session precache of the game's pak (precache\).
 // ---------------------------------------------------------------------------------------------
 
 static std::mutex g_convMu;
 static bool g_convRunning = false, g_convPending = false;
 
-// Runs `python -I tools\convert.py <args>` with output appended to convert.log; returns the exit code
-// (~0u if it could not run).
-static DWORD RunConvertPy(const std::wstring& args, DWORD priority) {
+static bool HaveConvExe() {
+    return GetFileAttributesW((g_dir + L"tools\\meshemu-conv.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Runs the converter with output appended to convert.log: tools\meshemu-conv.exe <args>, or without it
+// `python -I tools\convert.py <args>` (same arguments). Returns the exit code (~0u if it could not run).
+static DWORD RunConvertTool(const std::wstring& args, DWORD priority) {
     std::wstring tools = g_dir + L"tools\\";
-    std::wstring script = tools + L"convert.py";
-    if (GetFileAttributesW(script.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        LOG_N(1, "no tools\\convert.py next to the proxy; automatic conversion disabled");
-        return ~0u;
+    std::wstring cmd;
+    if (HaveConvExe()) {
+        cmd = L"\"" + tools + L"meshemu-conv.exe\" " + args;
+    } else {
+        std::wstring script = tools + L"convert.py";
+        if (GetFileAttributesW(script.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            LOG_N(1, "no tools\\meshemu-conv.exe or tools\\convert.py next to the proxy; automatic conversion disabled");
+            return ~0u;
+        }
+        cmd = L"python -I \"" + script + L"\" " + args;
     }
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE logf = CreateFileW((g_dir + L"convert.log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    std::wstring cmd = L"python -I \"" + script + L"\" " + args;
     STARTUPINFOW si = {sizeof(si)};
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = si.hStdError = logf;
@@ -559,7 +579,7 @@ static DWORD RunConvertPy(const std::wstring& args, DWORD priority) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     } else {
-        Log("could not start python for conversion (%lu)", GetLastError());
+        Log("could not start the converter (%lu): %ls", GetLastError(), cmd.c_str());
     }
     if (logf != INVALID_HANDLE_VALUE) CloseHandle(logf);
     return code;
@@ -567,7 +587,7 @@ static DWORD RunConvertPy(const std::wstring& args, DWORD priority) {
 
 static void RunConverter() {
     ULONGLONG t0 = GetTickCount64();
-    DWORD code = RunConvertPy(L"\"" + g_dir + L"dump\" \"" + g_dir + L"cache\"", BELOW_NORMAL_PRIORITY_CLASS);
+    DWORD code = RunConvertTool(L"\"" + g_dir + L"dump\" \"" + g_dir + L"cache\"", BELOW_NORMAL_PRIORITY_CLASS);
     if (code != ~0u)
         Log("converter finished (exit %lu, %llu ms)", code, (unsigned long long)(GetTickCount64() - t0));
 }
@@ -590,6 +610,7 @@ static bool Needs16(const D3D12_SHADER_BYTECODE* bc) {
 static bool Lower16(const D3D12_SHADER_BYTECODE& bc, std::vector<char>& out) {
     std::lock_guard<std::mutex> lk(g_lower16Mu);
     std::string id = ShaderId(bc);
+    if (ReadFileBytes(g_dir + L"precache\\lower16\\" + Widen(id) + L".dxil", out)) return true;
     std::wstring dst = g_dir + L"cache\\lower16\\" + Widen(id) + L".dxil";
     if (ReadFileBytes(dst, out)) return true;
     CreateDirectoryW((g_dir + L"cache\\lower16").c_str(), nullptr);
@@ -597,11 +618,26 @@ static bool Lower16(const D3D12_SHADER_BYTECODE& bc, std::vector<char>& out) {
     std::wstring src = g_dir + L"dump\\lower16\\" + Widen(id) + L".dxil";
     WriteFileBytes(src, bc.pShaderBytecode, bc.BytecodeLength);
     ULONGLONG t0 = GetTickCount64();
-    bool ok = RunConvertPy(L"--lower16 \"" + src + L"\" \"" + dst + L"\"", NORMAL_PRIORITY_CLASS) == 0 &&
+    bool ok = RunConvertTool(L"--lower16 \"" + src + L"\" \"" + dst + L"\"", NORMAL_PRIORITY_CLASS) == 0 &&
               ReadFileBytes(dst, out);
     Log("lowered native 16-bit shader %s: %s (%llu ms)", id.c_str(), ok ? "ok" : "FAILED, see convert.log",
         (unsigned long long)(GetTickCount64() - t0));
     return ok;
+}
+
+// Precache (meshemu-conv.exe only): every mesh shader in the game's pak that runs in VS mode is converted
+// ahead of time into precache\<ms>.cs10.dxil/.vs10.dxil/.meta10, which do not depend on the pixel shader, so
+// BuildEmu finds pipelines the game has never created before. --lower16 on GPUs without native 16-bit ops
+// also fills precache\lower16\. The exe skips the scan when the pak and the exe are unchanged (stamp.txt).
+static void RunPrecache() {
+    if (!HaveConvExe()) return;
+    ULONGLONG t0 = GetTickCount64();
+    std::wstring meshemu = g_dir.substr(0, g_dir.size() - 1);  // no trailing '\' before the quote; the exe walks up
+    DWORD code = RunConvertTool(L"precache \"" + meshemu + L"\" \"" + g_dir + L"precache\"" +
+                                    (g_native16.load() == 0 ? L" --lower16" : L""),
+                                BELOW_NORMAL_PRIORITY_CLASS);
+    if (code != ~0u)
+        Log("precache finished (exit %lu, %llu ms)", code, (unsigned long long)(GetTickCount64() - t0));
 }
 
 static void RequestConvert() {
@@ -612,6 +648,8 @@ static void RequestConvert() {
     }
     g_convRunning = true;
     std::thread([] {
+        static std::once_flag precache;
+        std::call_once(precache, RunPrecache);
         for (;;) {
             RunConverter();
             std::lock_guard<std::mutex> lk(g_convMu);
@@ -632,6 +670,9 @@ static void DumpMeshPipeline(const StreamView& sv, const std::string& ms, const 
     save(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms, L".ms.dxil");
     save(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps, L".ps.dxil");
     save(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, as, L".as.dxil");
+    // A precached mesh shader needs no per-pair conversion; BuildEmu writes the .pair if its pipeline fails.
+    if (as == "none" && GetFileAttributesW((g_dir + L"precache\\" + Widen(ms) + L".vs10.dxil").c_str()) != INVALID_FILE_ATTRIBUTES)
+        return;
     std::string pair = ms + "_" + ps + (as != "none" ? "_" + as : "") + ".pair";
     if (WriteFileBytes(dump + Widen(pair), "", 0)) RequestConvert();
 }
@@ -641,12 +682,24 @@ static bool BuildEmu(EmuPso* e, ID3D12Device2* dev, const char** why) {
     std::vector<char> csBytes, vsBytes, metaBytes;
     std::wstring cache = g_dir + L"cache\\";
     if (e->amplification) { *why = "amplification shader"; return false; }
-    if (!ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".cs9.dxil", csBytes) ||
-        !ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".vs9.dxil", vsBytes) ||
-        !ReadFileBytes(cache + Widen(e->ms + "_" + e->ps) + L".meta9", metaBytes)) {
-        *why = "not converted";
-        return false;
+    std::wstring pair = cache + Widen(e->ms + "_" + e->ps), pre = g_dir + L"precache\\" + Widen(e->ms);
+    bool precached = false;
+    if (!ReadFileBytes(pair + L".cs10.dxil", csBytes) || !ReadFileBytes(pair + L".vs10.dxil", vsBytes) ||
+        !ReadFileBytes(pair + L".meta10", metaBytes)) {
+        // No per-pair conversion (yet): the precached one for the mesh shader (.vs10 is written last).
+        if (e->noPrecache || !ReadFileBytes(pre + L".vs10.dxil", vsBytes) || !ReadFileBytes(pre + L".cs10.dxil", csBytes) ||
+            !ReadFileBytes(pre + L".meta10", metaBytes)) {
+            *why = "not converted";
+            return false;
+        }
+        precached = true;
     }
+    // A precached conversion skips convert.py's VS/PS linkage check; if its pipeline fails, convert the pair.
+    auto precacheFailed = [&] {
+        if (!precached) return;
+        e->noPrecache = true;
+        if (WriteFileBytes(g_dir + L"dump\\" + Widen(e->ms + "_" + e->ps) + L".pair", "", 0)) RequestConvert();
+    };
     RsInfo* ri = e->rs ? FindRs(e->rs) : nullptr;
     if (!ri || ri->emuUav < 0 || !ri->compute) { *why = "root signature has no emulation params"; return false; }
     unsigned mv = 0, mp = 0, rowBytes = 0, maxGroups = 0, idxRegion = 0;
@@ -662,7 +715,8 @@ static bool BuildEmu(EmuPso* e, ID3D12Device2* dev, const char** why) {
     ID3D12PipelineState *cs = nullptr, *gfx = nullptr;
     HRESULT hr = dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&cs));
     if (FAILED(hr)) {
-        Log("CreateComputePipelineState for ms=%s failed %08x", e->ms.c_str(), hr);
+        Log("CreateComputePipelineState for ms=%s%s failed %08x", e->ms.c_str(), precached ? " (precached)" : "", hr);
+        precacheFailed();
         *why = "compute PSO failed";
         return false;
     }
@@ -676,17 +730,21 @@ static bool BuildEmu(EmuPso* e, ID3D12Device2* dev, const char** why) {
     hr = ORIG(t_devCreatePipelineState, dev, HRESULT(STDMETHODCALLTYPE*)(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*,
                                                                        REFIID, void**))(dev, &nd, IID_PPV_ARGS(&gfx));
     if (FAILED(hr)) {
-        Log("emulated graphics PSO for ms=%s ps=%s failed %08x", e->ms.c_str(), e->ps.c_str(), hr);
+        Log("emulated graphics PSO for ms=%s ps=%s%s failed %08x", e->ms.c_str(), e->ps.c_str(),
+            precached ? " (precached)" : "", hr);
         cs->Release();
+        precacheFailed();
         *why = "graphics PSO failed";
         return false;
     }
+    if (precached) LOG_N(50, "ms=%s ps=%s: precached conversion", e->ms.c_str(), e->ps.c_str());
     e->maxPrims = mp;
     e->maxGroups = maxGroups;
     e->idxRegion = idxRegion;
     e->emuSrv = ri->emuSrv;
     e->emuUav = ri->emuUav;
     e->emuArgs = ri->emuArgs;
+    e->emuOff = ri->emuOff;
     e->computeRs = ri->compute;
     e->cs = cs;
     e->gfx = gfx;
@@ -954,10 +1012,23 @@ static std::unordered_map<ID3D12CommandSignature*, UINT> g_meshSigs;
 
 static HRESULT STDMETHODCALLTYPE Hk_CreateCommandSignature(ID3D12Device* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                                            ID3D12RootSignature* rs, REFIID riid, void** out) {
-    HRESULT hr = ORIG(t_devCreateCommandSignature, self, decltype(&Hk_CreateCommandSignature))(self, desc, rs, riid, out);
+    auto orig = ORIG(t_devCreateCommandSignature, self, decltype(&Hk_CreateCommandSignature));
+    HRESULT hr = orig(self, desc, rs, riid, out);
     bool mesh = false;
     for (UINT i = 0; i < desc->NumArgumentDescs; i++)
         mesh |= desc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    if (mesh && FAILED(hr)) {
+        // Runtimes or drivers without mesh shader support may reject DISPATCH_MESH. The signature is only a
+        // key for Hk_ClExecuteIndirect and never executed, so stand in a DISPATCH one with the same layout.
+        std::vector<D3D12_INDIRECT_ARGUMENT_DESC> args(desc->pArgumentDescs, desc->pArgumentDescs + desc->NumArgumentDescs);
+        for (auto& a : args)
+            if (a.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC d2 = *desc;
+        d2.pArgumentDescs = args.data();
+        HRESULT hr2 = orig(self, &d2, rs, riid, out);
+        LOG_N(5, "mesh command signature rejected (%08x); DISPATCH stand-in -> %08x", hr, hr2);
+        hr = hr2;
+    }
     if (mesh) {
         LOG_N(50, "mesh command signature: %u args, stride %u -> %08x", desc->NumArgumentDescs, desc->ByteStride, hr);
         if (SUCCEEDED(hr) && out && *out) {
@@ -1394,36 +1465,59 @@ static void STDMETHODCALLTYPE Hk_ClDispatchMesh(List* self, UINT x, UINT y, UINT
     }
     UINT64 groups = (UINT64)x * y * z;
     if (!groups) return;
-    if (groups > e->maxGroups) LOG_N(20, "DispatchMesh %ux%ux%u exceeds scratch, clamped", x, y, z);
     g_emulatedDirect.fetch_add(1);
-    UINT slot = g_emu.uploadHead.fetch_add(1) % kUploadSlots;
-    UINT* dims = g_emu.uploadPtr + slot * 4;
-    dims[0] = x;
-    dims[1] = y;
-    dims[2] = z;
 
-    UINT64 prof = ProfBegin(self);
-    ToStates(self, s, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    SetPso(self, e->cs);
-    BindAsCompute(self, e->computeRs, s->gfx);
-    ((decltype(&Hk_CSetUav))OrigFor(t_clSetRoot[10], self))(self, e->emuUav, g_emu.scratchVA);
-    ((decltype(&Hk_CSetSrv))OrigFor(t_clSetRoot[8], self))(self, e->emuArgs, g_emu.upload->GetGPUVirtualAddress() + slot * 16);
+    // A dispatch larger than scratch holds (maxGroups) is split into chunks of whole xy slices, x rows or x
+    // runs, each its own cs + draw with chunk-local group ids; the group offset constants (ABI v10) give the
+    // game's code its original SV_GroupID.
+    UINT64 mg = e->maxGroups;
+    UINT cx = x, cy = y, cz = z;
+    if (groups > mg) {
+        if ((UINT64)x * y <= mg) cz = (UINT)(mg / ((UINT64)x * y));
+        else if (x <= mg) cy = (UINT)(mg / x), cz = 1;
+        else cx = (UINT)mg, cy = cz = 1;
+        LOG_N(50, "DispatchMesh %ux%ux%u exceeds scratch (%u groups): split into %llu chunks of %ux%ux%u", x, y, z,
+              e->maxGroups, (unsigned long long)((x + cx - 1) / cx) * ((y + cy - 1) / cy) * ((z + cz - 1) / cz),
+              cx, cy, cz);
+    }
     using DispatchFn = void(STDMETHODCALLTYPE*)(List*, UINT, UINT, UINT);
-    ((DispatchFn)ClVt(self, kClDispatch))(self, x, y, z);
-    ProfMark(self, prof, 1);
-
-    ToStates(self, s, kScratchRead);
-    SetPso(self, e->gfx);
-    CL_ORIG(t_clIASetPrimitiveTopology, Hk_ClIASetPrimitiveTopology)(self, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    D3D12_INDEX_BUFFER_VIEW ibv = {g_emu.scratchVA, e->idxRegion, DXGI_FORMAT_R32_UINT};
-    CL_ORIG(t_clIASetIndexBuffer, Hk_ClIASetIndexBuffer)(self, &ibv);
-    ((decltype(&Hk_GSetSrv))OrigFor(t_clSetRoot[9], self))(self, e->emuSrv, g_emu.scratchVA);
-    // ABI v7: a mesh shader run as the VS reads the dispatch size to split SV_VertexID into group coordinates.
-    ((decltype(&Hk_GSetSrv))OrigFor(t_clSetRoot[9], self))(self, e->emuArgs, g_emu.upload->GetGPUVirtualAddress() + slot * 16);
-    UINT draw = (UINT)((groups < e->maxGroups ? groups : e->maxGroups) * e->maxPrims * 3);
     using DrawIdxFn = void(STDMETHODCALLTYPE*)(List*, UINT, UINT, UINT, INT, UINT);
-    ((DrawIdxFn)ClVt(self, kClDrawIndexedInstanced))(self, draw, 1, 0, 0, 0);
-    ProfMark(self, prof, 2);
+    for (UINT oz = 0; oz < z; oz += cz)
+        for (UINT oy = 0; oy < y; oy += cy)
+            for (UINT ox = 0; ox < x; ox += cx) {
+                UINT n[3] = {(std::min)(cx, x - ox), (std::min)(cy, y - oy), (std::min)(cz, z - oz)};
+                UINT o[3] = {ox, oy, oz};
+                UINT slot = g_emu.uploadHead.fetch_add(1) % kUploadSlots;
+                UINT* dims = g_emu.uploadPtr + slot * 4;
+                dims[0] = n[0];
+                dims[1] = n[1];
+                dims[2] = n[2];
+                D3D12_GPU_VIRTUAL_ADDRESS dimsVA = g_emu.upload->GetGPUVirtualAddress() + slot * 16;
+
+                UINT64 prof = ProfBegin(self);
+                ToStates(self, s, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                SetPso(self, e->cs);
+                BindAsCompute(self, e->computeRs, s->gfx);
+                ((decltype(&Hk_CSetUav))OrigFor(t_clSetRoot[10], self))(self, e->emuUav, g_emu.scratchVA);
+                ((decltype(&Hk_CSetSrv))OrigFor(t_clSetRoot[8], self))(self, e->emuArgs, dimsVA);
+                ((decltype(&Hk_CSetCN))OrigFor(t_clSetRoot[4], self))(self, e->emuOff, kEmuOffDwords, o, 0);
+                ((DispatchFn)ClVt(self, kClDispatch))(self, n[0], n[1], n[2]);
+                ProfMark(self, prof, 1);
+
+                ToStates(self, s, kScratchRead);
+                SetPso(self, e->gfx);
+                CL_ORIG(t_clIASetPrimitiveTopology, Hk_ClIASetPrimitiveTopology)(self, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                D3D12_INDEX_BUFFER_VIEW ibv = {g_emu.scratchVA, e->idxRegion, DXGI_FORMAT_R32_UINT};
+                CL_ORIG(t_clIASetIndexBuffer, Hk_ClIASetIndexBuffer)(self, &ibv);
+                ((decltype(&Hk_GSetSrv))OrigFor(t_clSetRoot[9], self))(self, e->emuSrv, g_emu.scratchVA);
+                // ABI v7: a mesh shader run as the VS reads the dispatch size to split SV_VertexID into group
+                // coordinates (chunk-local; v10 adds the offset).
+                ((decltype(&Hk_GSetSrv))OrigFor(t_clSetRoot[9], self))(self, e->emuArgs, dimsVA);
+                ((decltype(&Hk_GSetCN))OrigFor(t_clSetRoot[5], self))(self, e->emuOff, kEmuOffDwords, o, 0);
+                UINT draw = n[0] * n[1] * n[2] * e->maxPrims * 3;
+                ((DrawIdxFn)ClVt(self, kClDrawIndexedInstanced))(self, draw, 1, 0, 0, 0);
+                ProfMark(self, prof, 2);
+            }
     RestoreAfterEmu(self, s);
 }
 
@@ -1431,6 +1525,9 @@ static void STDMETHODCALLTYPE Hk_ClDispatchMesh(List* self, UINT x, UINT y, UINT
 //   [scratch -> UAV]  cs via ExecuteIndirect({DISPATCH}) on the game's own argument record
 //   [scratch -> read] ExecuteIndirect(DRAW_INDEXED) from the arguments the cs wrote; the game's record is the
 //                     count buffer, so a command with x == 0 (no groups, nothing written) draws nothing.
+// The group count is only known on the GPU, so unlike direct draws these are not split: groups beyond
+// maxGroups are still dropped (their writes land in scratch's trash range).
+static const UINT kNoOffset[kEmuOffDwords] = {};
 static void EmulateIndirect(List* self, ClState* s, EmuPso* e, UINT argStride, UINT maxCount, ID3D12Resource* args,
                             UINT64 argsOff) {
     auto ei = ORIG(t_clExecuteIndirect, self, decltype(&Hk_ClExecuteIndirect));
@@ -1444,6 +1541,7 @@ static void EmulateIndirect(List* self, ClState* s, EmuPso* e, UINT argStride, U
         BindAsCompute(self, e->computeRs, s->gfx);
         ((decltype(&Hk_CSetUav))OrigFor(t_clSetRoot[10], self))(self, e->emuUav, g_emu.scratchVA);
         ((decltype(&Hk_CSetSrv))OrigFor(t_clSetRoot[8], self))(self, e->emuArgs, argsVA + (UINT64)k * argStride);
+        ((decltype(&Hk_CSetCN))OrigFor(t_clSetRoot[4], self))(self, e->emuOff, kEmuOffDwords, kNoOffset, 0);
         ei(self, g_emu.dispatchSig, 1, args, off, nullptr, 0);
         ProfMark(self, prof, 1);
 
@@ -1455,6 +1553,7 @@ static void EmulateIndirect(List* self, ClState* s, EmuPso* e, UINT argStride, U
         CL_ORIG(t_clIASetIndexBuffer, Hk_ClIASetIndexBuffer)(self, &ibv);
         ((decltype(&Hk_GSetSrv))OrigFor(t_clSetRoot[9], self))(self, e->emuSrv, g_emu.scratchVA);
         ((decltype(&Hk_GSetSrv))OrigFor(t_clSetRoot[9], self))(self, e->emuArgs, argsVA + (UINT64)k * argStride);
+        ((decltype(&Hk_GSetCN))OrigFor(t_clSetRoot[5], self))(self, e->emuOff, kEmuOffDwords, kNoOffset, 0);
         ei(self, g_emu.drawIndexedSig, 1, g_emu.scratch, kDrawArgs, args, off);
         ProfMark(self, prof, 2);
     }
@@ -1579,8 +1678,15 @@ static void HookDevice(void* obj) {
     // What the GPU lacks that game shaders may need (the patch only fills in mesh shaders).
     static std::once_flag once;
     std::call_once(once, [d] {
+        // Older runtimes reject shader models they do not know, so step down until one is accepted.
         D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_8};
-        if (FAILED(d->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) sm.HighestShaderModel = (D3D_SHADER_MODEL)0;
+        while (sm.HighestShaderModel && FAILED(d->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))))
+            sm.HighestShaderModel = sm.HighestShaderModel > D3D_SHADER_MODEL_6_0   ? (D3D_SHADER_MODEL)(sm.HighestShaderModel - 1)
+                                    : sm.HighestShaderModel == D3D_SHADER_MODEL_6_0 ? D3D_SHADER_MODEL_5_1
+                                                                                     : (D3D_SHADER_MODEL)0;
+        if (sm.HighestShaderModel < D3D_SHADER_MODEL_6_6)
+            Log("WARNING: shader model %x < 6.6; the game and the patch need 6.6 (Windows 10 too old, or the game's "
+                "D3D12 Agility SDK did not load)", sm.HighestShaderModel);
         D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {};
         d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4));
         g_native16 = o4.Native16BitShaderOpsSupported ? 1 : 0;
@@ -1601,6 +1707,9 @@ extern "C" HRESULT WINAPI Proxy_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE
         // mesh shaders, which we emulate.
         HRESULT hr121 = g_realCreateDevice(adapter, D3D_FEATURE_LEVEL_12_1, riid, out);
         LOG_N(20, "D3D12CreateDevice(12_2) failed %08x, retried at 12_1 -> %08x", hr, hr121);
+        if (hr == E_INVALIDARG)
+            LOG_N(1, "WARNING: the D3D12 runtime does not know feature level 12_2. Windows is older than 10 version 2004 "
+                     "or the game's D3D12 Agility SDK did not load; update Windows");
         if (SUCCEEDED(hr121)) {
             g_spoof122 = true;
             hr = hr121;

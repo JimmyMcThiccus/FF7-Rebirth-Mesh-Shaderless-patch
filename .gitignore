@@ -18,3 +18,6 @@ dist/
 # never commit shaders dumped from or converted for the game
 meshemu/
 *.ll
+
+# Rust build output
+conv/target/

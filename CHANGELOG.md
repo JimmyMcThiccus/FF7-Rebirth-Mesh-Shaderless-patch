@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.0-beta (2026-11-03): no Python, mesh shaders precached from the pak
+
+- **Python is no longer needed.** The shader converter is now `meshemu-conv.exe`, a self-contained Rust
+  port of `convert.py` (`conv/`) that calls DXC's `dxcompiler.dll` and `dxil.dll` directly. It produces
+  byte-identical shaders (checked on the 32 game pairs in VS mode, the fallback scheme, chunked draws and
+  16-bit lowering). The installer no longer checks for Python and removes the old `convert.py` and
+  `dxasm.exe` from `meshemu\tools`.
+- **Precache:** at the first start and after game updates, every mesh shader in the game's pak is converted
+  ahead of time, in the background (`meshemu\precache`; about 10 seconds for 3,344 mesh shaders on 40
+  threads). New areas and changed settings no longer show missing geometry while their shaders convert.
+  2,639 of the mesh shaders run as vertex shaders and are precached; the rest (groupshared memory,
+  per-primitive outputs) still convert per pair when the game first uses them. On GPUs without native 16-bit
+  ops the game's other 16-bit shaders are lowered ahead of time too.
+- A `DispatchMesh` too large for the patch's working buffer is now drawn in several pieces instead of
+  losing the groups past the limit. `meshemu.log` shows a `split into N chunks` line when this happens. The
+  converted shaders get each piece's group offset, so the game's shaders see their original group ids.
+  `ExecuteIndirect` mesh draws are still clamped, because their size is only known on the GPU. The largest
+  draw seen in the game fits in the buffer, so this is a safeguard. It is also a step towards a smaller
+  working buffer on 4 GB cards. The idea comes from lonewolf0622's DirectMesh (see
+  THIRD_PARTY_NOTICES.md).
+- The converted shader cache moved to a new format (`*.cs10/.vs10/.meta10`); shaders are reconverted once.
+
 ## v0.2.0-beta (2026-10-31): Pascal and earlier GPUs
 
 - Runs on GPUs without native 16-bit shader math, such as Pascal; tested on an NVIDIA Quadro P1000. Before,

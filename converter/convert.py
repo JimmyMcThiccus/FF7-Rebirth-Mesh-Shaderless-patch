@@ -2,17 +2,20 @@
 
     python -I convert.py <dump dir> <cache dir>
 
-ABI v9: the v7 design (see docs/DESIGN.md) with native 16-bit loads lowered (lower_native16) and a 256 MB
-scratch buffer. For every <ms>_<ps>[...].pair in the dump dir:
+ABI v10: the v7 design (see docs/DESIGN.md) with native 16-bit loads lowered (lower_native16), a 256 MB
+scratch buffer and a group offset (add_group_offset): the proxy splits a direct DispatchMesh larger than
+maxGroups into chunks, and the cbuffer b0 space999 {ox, oy, oz} restores the game's SV_GroupID in each chunk.
+For every <ms>_<ps>[...].pair in the dump dir:
   VS mode, when vs_mode_blocker() allows it (thread t writes only vertex t, no cross-thread communication):
-    <cache>/<ms>_<ps>.cs9.dxil   mesh shader as a compute shader that stores only indices + draw arguments
-    <cache>/<ms>_<ps>.vs9.dxil   the mesh shader itself as the vertex shader (convert_ms_to_vs); vertices
-                                 never go through scratch
+    <cache>/<ms>_<ps>.cs10.dxil   mesh shader as a compute shader that stores only indices + draw arguments
+    <cache>/<ms>_<ps>.vs10.dxil   the mesh shader itself as the vertex shader (convert_ms_to_vs); vertices
+                                  never go through scratch
   otherwise the v5 scheme (CS stores packed vertices, generated pass-through VS), under the same names.
-  <cache>/<ms>_<ps>.meta9      "maxVerts maxPrims vertexBytes maxGroups idxRegion" (vertexBytes 0 in VS mode)
+  <cache>/<ms>_<ps>.meta10       "maxVerts maxPrims vertexBytes maxGroups idxRegion" (vertexBytes 0 in VS mode)
   MESHEMU_NO_VS_MODE=1 forces the fallback for every pair (for A/B tests).
+  MESHEMU_TEST_MAX_GROUPS=<n> caps maxGroups at n, so tests exercise the proxy's chunked draws.
 
-Scratch layout for one emulated draw (group G = linear SV_GroupID):
+Scratch layout for one emulated draw or chunk (group G = linear chunk-local SV_GroupID):
   [0, idxRegion)            uint3 indices[maxGroups][maxPrims], global (G * maxVerts + local); unused = degenerate
   [idxRegion, ...)          vertices[maxGroups * maxVerts], vertexBytes each (kept outputs, see plan_layout)
   [SCRATCH_CAP, +20)        DrawIndexed arguments, written by group 0 thread 0
@@ -194,6 +197,32 @@ def ensure_decl(mod, name, decl):
         mod.lines.append(decl)
 
 
+def add_group_offset(mod, res):
+    """ABI v10: declare the group offset cbuffer (b0 space999: the proxy's 3 root constants {ox, oy, oz}) in
+    the resource list res (modified in place) and return the entry-block lines that load it into %emu.ox,
+    %emu.oy, %emu.oz. The proxy splits a DispatchMesh larger than maxGroups into chunks; each chunk runs with
+    chunk-local group ids and the offset puts the game's SV_GroupID back at its original value."""
+    ensure_type(mod, "%dx.types.CBufRet.i32", "{ i32, i32, i32, i32 }")
+    ensure_type(mod, "%struct.EmuGroupOffset", "{ <3 x i32> }")
+    lst = md_items(mod.md[md_ref(res[2])]) if res[2] != "null" else []
+    nid = mod.add_md(f"!{{i32 {len(lst)}, %struct.EmuGroupOffset* undef, !\"\", i32 {EMU_SPACE}, i32 0, i32 1, "
+                     "i32 12, null}")
+    res[2] = f"!{mod.add_md('!{' + ', '.join(lst + [f'!{nid}']) + '}')}"
+    ensure_decl(mod, "dx.op.cbufferLoadLegacy.i32",
+                "declare %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32(i32, %dx.types.Handle, i32) "
+                f"#{attr_group(mod, 'nounwind readonly')}")
+    return [
+        "  %emu.hc = call %dx.types.Handle @dx.op.createHandleFromBinding(i32 217, %dx.types.ResBind "
+        f"{{ i32 0, i32 0, i32 {EMU_SPACE}, i8 2 }}, i32 0, i1 false)",
+        "  %emu.cb = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle %emu.hc, "
+        "%dx.types.ResourceProperties { i32 13, i32 12 })",
+        "  %emu.o = call %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32(i32 59, %dx.types.Handle %emu.cb, i32 0)",
+        "  %emu.ox = extractvalue %dx.types.CBufRet.i32 %emu.o, 0",
+        "  %emu.oy = extractvalue %dx.types.CBufRet.i32 %emu.o, 1",
+        "  %emu.oz = extractvalue %dx.types.CBufRet.i32 %emu.o, 2",
+    ]
+
+
 # ------------------------------------------------------------------------------------------------
 # Mesh shader -> compute shader
 # ------------------------------------------------------------------------------------------------
@@ -328,12 +357,13 @@ def convert_ms(ms_ll, ps_inputs, index_only=False):
     max_verts, max_prims = int_val(ms_state[1]), int_val(ms_state[2])
     if int_val(ms_state[3]) != 2:
         raise ConvertError("only triangle topology supported")
-    nthreads = 1
-    for x in md_items(mod.md[md_ref(ms_state[0])]):
-        nthreads *= int_val(x)
+    tdims = [int_val(x) for x in md_items(mod.md[md_ref(ms_state[0])])]
+    nthreads = tdims[0] * tdims[1] * tdims[2]
     idx_bytes = max_prims * 12
     vtx_bytes = max_verts * vertex_bytes
     max_groups = SCRATCH_CAP // (idx_bytes + vtx_bytes)
+    if os.environ.get("MESHEMU_TEST_MAX_GROUPS"):
+        max_groups = min(max_groups, int(os.environ["MESHEMU_TEST_MAX_GROUPS"]))
     idx_region = (max_groups * idx_bytes + 255) & ~255
     while idx_region + max_groups * vtx_bytes > SCRATCH_CAP:
         max_groups -= 1
@@ -365,6 +395,7 @@ def convert_ms(ms_ll, ps_inputs, index_only=False):
                ", i32 0, i32 1, i32 11, i1 false, i1 false, i1 false, null}}")
     append_res(0, "!{{i32 {id}, %struct.ByteAddressBuffer* undef, !\"\", i32 " + str(EMU_SPACE) +
                ", i32 1, i32 1, i32 11, i32 0, null}}")
+    offset_lines = add_group_offset(mod, res)
     mod.set_md(res_ref, "!{" + ", ".join(res) + "}")
     eitems[2] = "null"
     eitems[3] = f"!{res_ref}"
@@ -541,6 +572,10 @@ def convert_ms(ms_ll, ps_inputs, index_only=False):
                 f"  %emu.gv = mul i32 %emu.g, {max_verts}",
                 "  %emu.tid = call i32 @dx.op.flattenedThreadIdInGroup.i32(i32 96)",
             ]
+            # Scratch addressing above stays chunk-local; the game's own group/dispatch thread ids get the
+            # chunk's offset (see add_group_offset).
+            out += offset_lines
+            out += [f"  %emu.t{a} = mul i32 %emu.o{a}, {n}" for a, n in zip("xyz", tdims)]
             if not tail_fill:
                 # Fallback: pre-fill every primitive slot with a degenerate triangle, then a group barrier so
                 # the shader's own EmitIndices land afterwards.
@@ -580,6 +615,13 @@ def convert_ms(ms_ll, ps_inputs, index_only=False):
             ln = re.sub(r"(\[ [^\[\]]+, )%0 \]", r"\1%emu.cont ]", ln)
 
         code = ln.split(";")[0].rstrip() if "@dx.op." in ln else ln
+        m = re.match(r"^\s*(%[\w.]+) = call i32 @dx\.op\.(groupId|threadId)\.i32\(i32 (?:94|93), i32 ([012])\)$", code)
+        if m:
+            lhs, op, c = m.group(1), m.group(2), int(m.group(3))
+            raw, a = tmp(), "xyz"[c]
+            out.append(f"  {raw} = call i32 @dx.op.{op}.i32(i32 {94 if op == 'groupId' else 93}, i32 {c})")
+            out.append(f"  {lhs} = add i32 {raw}, %emu.{'o' if op == 'groupId' else 't'}{a}")
+            continue
         m = re.match(r"^\s*call void @dx\.op\.storeVertexOutput\.(\w+)\(i32 171, i32 (\d+), i32 ([^,]+), i8 (\d+), "
                      r"(\w+) ([^,]+), i32 ([^)]+)\)$", code)
         if m:
@@ -706,6 +748,7 @@ def convert_ms_to_vs(ms_ll):
     nid = mod.add_md(f"!{{i32 {len(lst)}, %struct.ByteAddressBuffer* undef, !\"\", i32 {EMU_SPACE}, i32 1, i32 1, "
                      "i32 11, i32 0, null}")
     res[0] = f"!{mod.add_md('!{' + ', '.join(lst + [f'!{nid}']) + '}')}"
+    offset_lines = add_group_offset(mod, res)
     mod.set_md(res_ref, "!{" + ", ".join(res) + "}")
     eitems[2] = f"!{sig_id}"
     eitems[3] = f"!{res_ref}"
@@ -751,10 +794,15 @@ def convert_ms_to_vs(ms_ll):
                 "i32 0, i32 undef, i8 3, i32 4)",
                 "  %emu.dimx = extractvalue %dx.types.ResRet.i32 %emu.d, 0",
                 "  %emu.dimy = extractvalue %dx.types.ResRet.i32 %emu.d, 1",
-                "  %emu.gx = urem i32 %emu.g, %emu.dimx",
+                "  %emu.cx = urem i32 %emu.g, %emu.dimx",
                 "  %emu.q = udiv i32 %emu.g, %emu.dimx",
-                "  %emu.gy = urem i32 %emu.q, %emu.dimy",
-                "  %emu.gz = udiv i32 %emu.q, %emu.dimy",
+                "  %emu.cy = urem i32 %emu.q, %emu.dimy",
+                "  %emu.cz = udiv i32 %emu.q, %emu.dimy",
+            ] + offset_lines + [
+                # Chunk-local group coordinates (G, the dims) plus the chunk's offset: the game's SV_GroupID.
+                "  %emu.gx = add i32 %emu.cx, %emu.ox",
+                "  %emu.gy = add i32 %emu.cy, %emu.oy",
+                "  %emu.gz = add i32 %emu.cz, %emu.oz",
                 f"  %emu.dx0 = mul i32 %emu.gx, {nthreads}",
                 "  %emu.dx = add i32 %emu.dx0, %emu.t",
             ]
@@ -969,7 +1017,7 @@ def lower_native16(ll):
 
 def convert_pair(dump, cache, ms, ps, log):
     pair = f"{ms}_{ps}"
-    vs_out = os.path.join(cache, f"{pair}.vs9.dxil")
+    vs_out = os.path.join(cache, f"{pair}.vs10.dxil")
     if os.path.exists(vs_out):
         return
     ps_inputs, ps_ll = None, None
@@ -986,7 +1034,7 @@ def convert_pair(dump, cache, ms, ps, log):
     why = os.environ.get("MESHEMU_NO_VS_MODE") and "disabled" or vs_mode_blocker(ms_ll)
     if why is None:
         try:
-            vs_ll_path = os.path.join(cache, f"{pair}.vs9.ll")
+            vs_ll_path = os.path.join(cache, f"{pair}.vs10.ll")
             with open(vs_ll_path, "w") as f:
                 f.write(convert_ms_to_vs(ms_ll))
             run([DXASM, vs_ll_path, tmp])
@@ -1003,13 +1051,13 @@ def convert_pair(dump, cache, ms, ps, log):
     vs_mode = why is None
 
     cs_ll, meta, outputs = convert_ms(ms_ll, ps_inputs, index_only=vs_mode)
-    ll_path = os.path.join(cache, f"{pair}.cs9.ll")
+    ll_path = os.path.join(cache, f"{pair}.cs10.ll")
     with open(ll_path, "w") as f:
         f.write(cs_ll)
-    run([DXASM, ll_path, os.path.join(cache, f"{pair}.cs9.dxil")])
+    run([DXASM, ll_path, os.path.join(cache, f"{pair}.cs10.dxil")])
 
     if not vs_mode:
-        hlsl_path = os.path.join(cache, f"{pair}.vs9.hlsl")
+        hlsl_path = os.path.join(cache, f"{pair}.vs10.hlsl")
         with open(hlsl_path, "w") as f:
             f.write(gen_vs(meta, outputs, ps_inputs))
         run([DXC, "-nologo", "-T", "vs_6_6", "-E", "main", "-O3", hlsl_path, "-Fo", tmp])
@@ -1018,7 +1066,7 @@ def convert_pair(dump, cache, ms, ps, log):
             if problems:
                 os.remove(tmp)
                 raise ConvertError("VS/PS linkage mismatch: " + "; ".join(problems))
-    with open(os.path.join(cache, f"{pair}.meta9"), "w") as f:
+    with open(os.path.join(cache, f"{pair}.meta10"), "w") as f:
         f.write("{max_verts} {max_prims} {vertex_bytes} {max_groups} {idx_region}\n".format(**meta))
     os.replace(tmp, vs_out)  # last: its presence marks the pair as converted
     if vs_mode:

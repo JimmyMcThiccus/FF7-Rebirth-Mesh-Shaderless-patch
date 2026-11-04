@@ -4,6 +4,8 @@
 # dxasm.exe). Git Bash; MESHEMU_RUN overrides the scratch folder.
 #   tests/run.sh [mode]   mode: harness argument (default: direct): direct|indirect|indirect3|multi|batch
 # Runs in a short directory (MAX_PATH). Set DEBUG=1 to enable the D3D12 debug layer for the emulated run.
+# MESHEMU_TEST_MAX_GROUPS=<n> (e.g. 20 or 4) makes the converter cap maxGroups, so direct draws of the 9x9-group
+# scene are split into chunks (ABI v10) and compared like any other run.
 set -e
 M="$(cd "$(dirname "$0")/.." && pwd)"
 RUN="${MESHEMU_RUN:-$(cygpath -u "$TEMP")/meshemu_run}"   # short path: the harness hits MAX_PATH in deep folders

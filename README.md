@@ -8,7 +8,7 @@ start on older GPUs. This patch is a drop-in `d3d12.dll` that sits next to the g
 support to the game and translates every mesh shader draw into compute and vertex shader work that older GPUs
 can run. The game's files are not modified.
 
-> **Status: v0.2.0 beta.** Tested on an NVIDIA TITAN V (Volta) and an NVIDIA Quadro P1000 (Pascal). Since
+> **Status: v0.3.0 beta.** Tested on an NVIDIA TITAN V (Volta) and an NVIDIA Quadro P1000 (Pascal). Since
 > v0.2.0 the patch also works on GPUs without native 16-bit shader math, such as Pascal; older generations
 > should benefit too but are untested. Other GPUs that meet the requirements below should work in principle.
 > Reports are welcome in the issues.
@@ -23,8 +23,6 @@ can run. The game's files are not modified.
   will still not run.
 - About **300 MB of VRAM** on top of what the game uses (the patch's working buffer). A 4 GB card runs the
   game at the lowest settings, with little memory to spare.
-- **Python 3.8 or newer** installed and on PATH as `python` ([python.org](https://www.python.org/downloads/),
-  tick "Add python.exe to PATH"). The patch converts the game's shaders in the background with it.
 - An internet connection during install: the installer downloads Microsoft's
   [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler) 1.8.2502 from its official
   GitHub release.
@@ -47,10 +45,10 @@ can run. The game's files are not modified.
 
 3. Start the game normally.
 
-**First launch:** the first time the game shows new kinds of geometry (the first launch, a new area, changed
-graphics settings), some of it is missing for a few seconds. The patch extracts those mesh shaders and
-converts them in the background, and they appear without a restart. Converted shaders are cached in
-`<game>\End\Binaries\Win64\meshemu\cache`.
+**First launch:** on the first launch, and after a game update, the patch reads the game's mesh shaders from
+its pak file and converts them in the background. This takes seconds to about a minute, depending on the CPU;
+geometry missing meanwhile appears without a restart. Later launches skip this. Converted shaders are cached
+in `<game>\End\Binaries\Win64\meshemu\precache` and `meshemu\cache`.
 
 If another mod already uses a `d3d12.dll`, the installer moves it to `d3d12.dll.meshemu-backup`, and
 uninstalling puts it back.
@@ -108,8 +106,7 @@ rendering. Tips:
   pipelines, skipped draws).
 - `<game>\End\Binaries\Win64\meshemu\convert.log`: shader conversion output. A pair that keeps failing
   there stays invisible.
-- Geometry missing for good: check that `python` works in a new command prompt and that `convert.log`
-  shows conversions. Shaders the patch cannot convert (amplification shaders, per-primitive outputs) are
+- Geometry missing for good: check that `convert.log` shows a `precache:` summary and conversions. Shaders the patch cannot convert (amplification shaders, per-primitive outputs) are
   logged and skipped. The game builds tested so far do not use them.
 - The game crashes while loading with a "Fatal error": look for `pipeline creation failed` lines in
   `meshemu.log`. They name each shader the GPU rejected and its required-feature flags, and the shaders are
@@ -121,32 +118,40 @@ rendering. Tips:
 
 - **Capability spoofing:** when the GPU refuses feature level 12_2, the device is created at 12_1, and the
   game is told 12_2 and mesh shader tier 1 are available.
-- **Shader conversion** (`converter/convert.py`): each mesh shader the game creates is dumped, rewritten at
-  the DXIL level and re-signed with Microsoft's validator. The game's mesh shaders compute vertex t and
-  primitive t in thread t without sharing data between threads. So the shader itself can run as the
-  **vertex shader**, and a small compute shader version writes only the triangle indices.
+- **Shader conversion** (`conv/`, `meshemu-conv.exe`, a self-contained Rust port of `converter/convert.py`
+  with identical output): mesh shaders are rewritten at the DXIL level and re-signed with Microsoft's
+  validator. The game's mesh shaders compute vertex t and primitive t in thread t without sharing data
+  between threads. So the shader itself can run as the **vertex shader**, and a small compute shader
+  version writes only the triangle indices. Those two do not depend on the pixel shader, so every mesh
+  shader in the game's pak is converted ahead of time (**precache**, about 10 seconds on 40 threads for
+  the game's 3,344 mesh shaders). Mesh shaders that cannot run as a vertex shader are converted per mesh
+  and pixel shader pair once the game creates the pipeline.
 - **16-bit shader math** (GPUs without native 16-bit support, such as Pascal): some of the game's shaders,
   mesh shaders and one particle compute shader, read 16-bit floats from typed buffers. The converter
   rewrites those reads as 32-bit reads; the GPU converts the stored values on load, so results are
   identical. When the GPU rejects one of the game's own pipelines for this reason, the patch rewrites the
-  shader with `convert.py --lower16` (cached in `meshemu\cache\lower16`) and retries.
+  shader with `meshemu-conv --lower16` (precached in `meshemu\precache\lower16` on such GPUs) and retries.
 - **Draw translation** (`proxy/proxy.cpp`): every `DispatchMesh` / `ExecuteIndirect(DISPATCH_MESH)` becomes
   "index compute pass, barrier, indexed draw" using the game's own indirect arguments, with the game's
-  root arguments replayed for the compute pass.
+  root arguments replayed for the compute pass. A `DispatchMesh` too large for the working buffer is drawn
+  in several such passes.
 
 [docs/DESIGN.md](docs/DESIGN.md) has the full design notes and the history of what was tried, including
 measurements of the approaches that did not pay off.
 
 ## Building from source
 
-Needs Visual Studio 2022 or newer with "Desktop development with C++", and Python 3.8+.
+Needs Visual Studio 2022 or newer with "Desktop development with C++", Rust (`cargo`), and Python 3.8+ for
+the build and test scripts.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-This downloads the pinned DXC release into `third_party\dxc`, builds `proxy\d3d12.dll` and
-`converter\dxasm.exe`, and writes the release zip to `dist\`. `tests/run.sh` (Git Bash) renders a test mesh
+This downloads the pinned DXC release into `third_party\dxc`, builds `proxy\d3d12.dll`,
+`conv\target\release\meshemu-conv.exe` and `converter\dxasm.exe`, and writes the release zip to `dist\`.
+`converter/convert.py` stays as the reference implementation: the proxy uses it when `meshemu-conv.exe` is
+missing, and both must produce byte-identical shaders. `tests/run.sh` (Git Bash) renders a test mesh
 shader scene with real mesh shaders on WARP and through the patch on your GPU and compares the pixels.
 `HARNESS_MS_GAME=1` uses a test shader shaped like the game's.
 

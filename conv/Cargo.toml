@@ -1,0 +1,17 @@
+[package]
+name = "meshemu-conv"
+version = "0.1.0"
+edition = "2021"
+description = "Shader converter for the FF7:Rebirth Mesh-Shaderless patch (port of converter/convert.py, plus pak precaching)"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode"] }
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"  # a converter bug in one shader is caught and logged; the others still convert
