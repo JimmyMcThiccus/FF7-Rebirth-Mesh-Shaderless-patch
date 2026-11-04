@@ -1,5 +1,6 @@
 //! The DirectX Shader Compiler through its COM interfaces: dxcompiler.dll (disassembler, assembler, HLSL
-//! compiler) and dxil.dll (validator, which signs the container), both loaded from next to the exe. This
+//! compiler) and the validator, which signs the container (dxil.dll if present, else dxcompiler.dll's own),
+//! loaded from next to the exe. This
 //! replaces dxc.exe and dxasm.exe; outputs are identical because the same DLL entry points do the work.
 //! One `Dxc` per thread: the instances are not shared.
 
@@ -101,9 +102,12 @@ impl Dxc {
                 }
                 Ok(std::mem::transmute::<*mut c_void, CreateInstance>(f))
             };
-            // dxil.dll first: dxcompiler.dll looks for it by name and finds the loaded module.
-            let dxil = load("dxil.dll")?;
+            // dxil.dll first when present: dxcompiler.dll looks for it by name and finds the loaded module.
+            // Without it, dxcompiler.dll's own validator signs (DXC 1.8.2502 open-sourced the validator hash):
+            // byte-identical containers, so the release ships only the open-source dxcompiler.dll.
+            let dxil = if dir.join("dxil.dll").is_file() { Some(load("dxil.dll")?) } else { None };
             let comp = load("dxcompiler.dll")?;
+            let dxil = dxil.unwrap_or(comp);
             let make = |f: CreateInstance, clsid: &Guid, iid: &Guid, what: &str| -> Result<Com, String> {
                 let mut p = null_mut();
                 let hr = f(clsid, iid, &mut p);

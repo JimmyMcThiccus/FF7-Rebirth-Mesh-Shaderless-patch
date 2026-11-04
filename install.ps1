@@ -1,34 +1,26 @@
-# Installs the FF7 Rebirth Mesh-Shaderless patch next to ff7rebirth_.exe.
+# Installs the FF7 Rebirth Mesh-Shaderless patch: the same as dragging the release zip's End folder into the
+# game folder, plus finding the game and keeping another mod's d3d12.dll. Runs from the unzipped package
+# folder that build.ps1 writes (dist\<name>, next to its End folder).
 #
-#   Right-click > Run with PowerShell, or:
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Game <...\End\Binaries\Win64>] [-DxcDir <folder>]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Game <...\End\Binaries\Win64>]
 #
 #   -Game     the game's End\Binaries\Win64 folder (found automatically for Steam and Epic installs)
-#   -DxcDir   folder that already has dxc.exe, dxcompiler.dll and dxil.dll (skips the download)
-param([string]$Game, [string]$DxcDir)
+param([string]$Game)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
-. (Join-Path $here 'get-dxc.ps1')
 . (Join-Path $here 'find-game.ps1')
 
 Write-Host 'FF7 Rebirth Mesh-Shaderless patch installer' -ForegroundColor Cyan
+$src = Join-Path $here 'End\Binaries\Win64'
+if (-not (Test-Path (Join-Path $src 'd3d12.dll'))) { throw "No End\Binaries\Win64\d3d12.dll next to $PSCommandPath." }
 
 $Game = Resolve-Game $Game
 Write-Host "Game: $Game"
 Assert-GameClosed
 
-# The proxy runs tools\meshemu-conv.exe (self-contained; it loads DXC's dxcompiler.dll and dxil.dll next to it).
-$meshemu = Join-Path $Game 'meshemu'
-$tools = Join-Path $meshemu 'tools'
-New-Item -ItemType Directory -Force $tools | Out-Null
-Copy-Item (Join-Path $here 'tools\meshemu-conv.exe') $tools -Force
-# The Python converter of v0.2.0 and earlier; the proxy prefers the exe, so these would only be confusing.
-foreach ($old in 'convert.py', 'dxasm.exe') { Remove-Item (Join-Path $tools $old) -ErrorAction SilentlyContinue }
-Install-Dxc $tools $DxcDir
-Write-Host "Converter tools -> $tools"
-
 # Keep a d3d12.dll that is not ours (another mod) instead of overwriting it.
 $dll = Join-Path $Game 'd3d12.dll'
+$meshemu = Join-Path $Game 'meshemu'
 $mark = Join-Path $meshemu 'installed-dll.sha256'
 if (Test-Path $dll) {
     $cur = (Get-FileHash $dll -Algorithm SHA256).Hash
@@ -39,9 +31,14 @@ if (Test-Path $dll) {
         Write-Warning "An existing d3d12.dll (another mod?) was moved to $backup"
     }
 }
-Copy-Item (Join-Path $here 'd3d12.dll') $dll -Force
-(Get-FileHash $dll -Algorithm SHA256).Hash | Set-Content $mark
-Write-Host "Patch DLL -> $dll"
+
+# d3d12.dll, meshemu\installed-dll.sha256, meshemu\tools (meshemu-conv.exe, dxcompiler.dll) and the docs.
+Copy-Item (Join-Path $src '*') $Game -Recurse -Force
+# Converter files of v0.2.0 and earlier (Python converter, downloaded DXC); no longer used.
+foreach ($old in 'convert.py', 'dxasm.exe', 'dxc.exe', 'dxil.dll') {
+    Remove-Item (Join-Path $meshemu "tools\$old") -ErrorAction SilentlyContinue
+}
+Write-Host "Patch -> $dll and $meshemu"
 
 Write-Host ''
 Write-Host 'Installed. On the first launch, and after game updates, the game''s mesh shaders are converted in the' -ForegroundColor Green

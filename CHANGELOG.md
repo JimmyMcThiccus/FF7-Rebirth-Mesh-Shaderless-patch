@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.1-beta (2026-11-03): drag-and-drop install
+
+- **Install by dragging one folder:** the release zip now mirrors the game folder. Drag its `End` folder
+  into the game folder (Steam: Manage → Browse local files) and start the game; no script, Python or
+  download. Uninstall by deleting `End\Binaries\Win64\d3d12.dll` and `End\Binaries\Win64\meshemu`.
+- **DirectX Shader Compiler bundled:** the package includes the official DXC 1.8.2502 `dxcompiler.dll`
+  (open source; its licenses are in `meshemu\tools\dxc-licenses`). `dxil.dll` is no longer needed:
+  `meshemu-conv.exe` signs shaders with `dxcompiler.dll`'s own validator when `dxil.dll` is absent, with
+  byte-identical results.
+- The docs are in `End\Binaries\Win64\meshemu`. `install.ps1` / `uninstall.ps1` remain in the repository for
+  a scripted install from a built package (`dist\<name>`).
+
 ## v0.3.0-beta (2026-11-03): no Python, mesh shaders precached from the pak
 
 - **Python is no longer needed.** The shader converter is now `meshemu-conv.exe`, a self-contained Rust

@@ -1,5 +1,5 @@
 //! meshemu-conv: the patch's shader converter as one self-contained exe (no Python). It needs only
-//! dxcompiler.dll and dxil.dll next to it.
+//! dxcompiler.dll next to it (and uses dxil.dll there if present).
 //!
 //!   meshemu-conv [convert] <dump dir> <cache dir>     convert.py's job: every dumped <ms>_<ps>.pair
 //!   meshemu-conv --lower16 <in.dxil> <out.dxil>        convert.py --lower16

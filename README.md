@@ -8,7 +8,7 @@ start on older GPUs. This patch is a drop-in `d3d12.dll` that sits next to the g
 support to the game and translates every mesh shader draw into compute and vertex shader work that older GPUs
 can run. The game's files are not modified.
 
-> **Status: v0.3.0 beta.** Tested on an NVIDIA TITAN V (Volta) and an NVIDIA Quadro P1000 (Pascal). Since
+> **Status: v0.3.1 beta.** Tested on an NVIDIA TITAN V (Volta) and an NVIDIA Quadro P1000 (Pascal). Since
 > v0.2.0 the patch also works on GPUs without native 16-bit shader math, such as Pascal; older generations
 > should benefit too but are untested. Other GPUs that meet the requirements below should work in principle.
 > Reports are welcome in the issues.
@@ -23,44 +23,32 @@ can run. The game's files are not modified.
   will still not run.
 - About **300 MB of VRAM** on top of what the game uses (the patch's working buffer). A 4 GB card runs the
   game at the lowest settings, with little memory to spare.
-- An internet connection during install: the installer downloads Microsoft's
-  [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler) 1.8.2502 from its official
-  GitHub release.
 
 ## Install
 
-1. Download `FF7R-Mesh-Shaderless-patch-<version>.zip` from
-   [Releases](../../releases) and extract it anywhere.
-2. Close the game. Right-click `install.ps1` and choose **Run with PowerShell**, or run:
+1. Download `FF7R-Mesh-Shaderless-patch-<version>.zip` from [Releases](../../releases) and close the game.
+2. Open the game folder. In Steam: right-click FINAL FANTASY VII REBIRTH → **Manage** → **Browse local
+   files**. It is the folder that has `End`, `Engine` and `ff7rebirth.exe`.
+3. Open the zip and drag its **`End`** folder into the game folder. Let Windows merge the folders and
+   replace the files when it asks.
+4. Start the game normally.
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File install.ps1
-   ```
+That puts `d3d12.dll` and a `meshemu` folder (the shader converter, the DirectX Shader Compiler DLL it uses,
+and these docs) in `End\Binaries\Win64`. Nothing else is needed: no Python, no download, no script. To
+update, do the same with the new zip.
 
-   The installer finds Steam and default Epic installs. Otherwise pass the game's binaries folder:
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File install.ps1 -Game "D:\Games\FINAL FANTASY VII REBIRTH\End\Binaries\Win64"
-   ```
-
-3. Start the game normally.
+**Another mod's `d3d12.dll`:** the patch has to be `End\Binaries\Win64\d3d12.dll`, so step 3 replaces any
+other `d3d12.dll` there (for example a feature-level spoof, which the patch already does itself). Move it
+somewhere safe first if you want it back later.
 
 **First launch:** on the first launch, and after a game update, the patch reads the game's mesh shaders from
 its pak file and converts them in the background. This takes seconds to about a minute, depending on the CPU;
 geometry missing meanwhile appears without a restart. Later launches skip this. Converted shaders are cached
 in `<game>\End\Binaries\Win64\meshemu\precache` and `meshemu\cache`.
 
-If another mod already uses a `d3d12.dll`, the installer moves it to `d3d12.dll.meshemu-backup`, and
-uninstalling puts it back.
-
 ## Uninstall
 
-```powershell
-powershell -ExecutionPolicy Bypass -File uninstall.ps1
-```
-
-This removes the patch DLL and the `meshemu` folder. Add `-KeepCache` to keep the converted shaders for a
-later reinstall.
+Close the game and delete `End\Binaries\Win64\d3d12.dll` and the `End\Binaries\Win64\meshemu` folder.
 
 ## Performance
 
@@ -149,7 +137,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
 This downloads the pinned DXC release into `third_party\dxc`, builds `proxy\d3d12.dll`,
-`conv\target\release\meshemu-conv.exe` and `converter\dxasm.exe`, and writes the release zip to `dist\`.
+`conv\target\release\meshemu-conv.exe` and `converter\dxasm.exe`, and writes the drag-and-drop release zip
+to `dist\`. The package folder `dist\<name>` also has `install.ps1` and `uninstall.ps1`, which find the
+game, keep another mod's `d3d12.dll` as `d3d12.dll.meshemu-backup` and put it back on uninstall.
 `converter/convert.py` stays as the reference implementation: the proxy uses it when `meshemu-conv.exe` is
 missing, and both must produce byte-identical shaders. `tests/run.sh` (Git Bash) renders a test mesh
 shader scene with real mesh shaders on WARP and through the patch on your GPU and compares the pixels.

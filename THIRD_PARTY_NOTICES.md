@@ -9,15 +9,27 @@ licensors of this Program grant you additional permission to convey the resultin
 
 ## DirectX Shader Compiler (Microsoft)
 
-The patch uses `dxc.exe`, `dxcompiler.dll` and `dxil.dll` from the
+The release package includes `dxcompiler.dll` (x64), unmodified, from the official
 [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler) release
 [v1.8.2502](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2502)
-(`dxc_2025_02_20.zip`). They are **not** included in this repository or in the release package. The
-installer and `build.ps1` download that official release from GitHub and copy the three files into place.
-They are licensed under the terms in that release's license files.
+(`dxc_2025_02_20.zip`), in `meshemu\tools`. The DirectX Shader Compiler is open source, built from LLVM and
+Clang: it is licensed under the University of Illinois/NCSA Open Source License (`LICENSE-LLVM.txt`) and
+the MIT License (`LICENSE-MIT.txt`). Those files and the release's `LICENSE-MS.txt` are included unmodified
+in `meshemu\tools\dxc-licenses`. The package does not include `dxil.dll`, Microsoft's separately licensed
+validator: since v1.8.2502, `dxcompiler.dll` signs shaders itself, and the result is byte-identical.
 
-`converter/dxasm.cpp` (part of this project) loads `dxcompiler.dll` and `dxil.dll` at run time through
-their public `DxcCreateInstance` interface. It includes `dxcapi.h` from the Windows SDK.
+`build.ps1` downloads that official release from GitHub (and `dxc.exe` and `dxil.dll` for building and
+testing, which are not redistributed). `meshemu-conv.exe` (`conv/src/dxc.rs`) and
+`converter/dxasm.cpp`, both part of this project, load `dxcompiler.dll` (and `dxil.dll` if present) at run
+time through their public `DxcCreateInstance` interface; `dxasm.cpp` includes `dxcapi.h` from the Windows
+SDK.
+
+## Rust crates (meshemu-conv.exe)
+
+`meshemu-conv.exe` statically links the Rust crates `lz4_flex`, `regex`, `regex-automata`, `regex-syntax`,
+`aho-corasick` and `memchr`, each used under the MIT License. Their copyright and license notices are in
+[conv/THIRD_PARTY_LICENSES.txt](conv/THIRD_PARTY_LICENSES.txt), included in the release package as
+`meshemu\tools\meshemu-conv-licenses.txt`.
 
 ## DirectMesh (lonewolf0622)
 
