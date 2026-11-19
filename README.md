@@ -15,6 +15,9 @@ can run. The game's files are not modified.
 
 ## Requirements
 
+
+- Linux is also supported as well however distro-distro compatibility may very, double check the issues/community to make sure
+
 - Windows 11, or Windows 10 version 22H2, 64-bit, and the Steam or Epic PC version of FINAL FANTASY VII
   REBIRTH. Older Windows 10 releases (1909 and earlier) have a D3D12 runtime that predates DX12 Ultimate and
   fail at startup with `CreateCommandSignature ... E_INVALIDARG`.
